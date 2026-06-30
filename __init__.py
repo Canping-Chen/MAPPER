@@ -13,7 +13,6 @@ from ._internal_config import (
     GraphConfig,
     NicheConfig,
     StudentConfig,
-    GroupingConfig,
     VAEConfig,
     DEFAULT,
 )
@@ -26,7 +25,6 @@ __all__ = [
     "GraphConfig",
     "NicheConfig",
     "StudentConfig",
-    "GroupingConfig",
     "VAEConfig",
     "DEFAULT",
 ]

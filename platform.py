@@ -5,8 +5,7 @@ Supported platforms
 -------------------
 - visium      : pixel coords; converted via ``adata.uns['spatial'][lib]['scalefactors']``.
                 Default radius = 150 um.
-- visium_hd   : same as visium, smaller bins. Default radius = 20 um.
-- xenium      : already in microns. Default radius = 20 um.
+- xenium      : already in microns. Default radius = 30 um.
 - generic     : assume coords are already in microns; user must supply a radius.
 - scRNA       : no spatial graph; cell-level mode.
 
@@ -21,18 +20,16 @@ import numpy as np
 
 PLATFORM_DEFAULT_RADIUS_UM = {
     "visium":     150.0,
-    "visium_hd":   20.0,
-    "xenium":      20.0,
+    "xenium":      30.0,
     "generic":   None,        # require user-provided
     "scRNA":     None,        # no graph
 }
 
 VISIUM_SPOT_DIAMETER_UM = 65.0  # 10x Visium fixed
-VISIUM_HD_BIN_DIAMETER_UM = 2.0  # 2 um bin (Visium HD default bin size)
 
 
 def is_spatial_platform(platform: str) -> bool:
-    return platform in {"visium", "visium_hd", "xenium", "generic"}
+    return platform in {"visium", "xenium", "generic"}
 
 
 def resolve_default_radius_um(platform: str, user_radius: Optional[float]) -> Optional[float]:
@@ -67,7 +64,7 @@ def coords_to_micron(
             f"adata.obsm['spatial'] must be (N, 2) or (N, 3); got {coords.shape}"
         )
 
-    if platform in {"visium", "visium_hd"}:
+    if platform == "visium":
         spot_diam_fullres = _resolve_visium_spot_diameter_fullres(adata)
         if spot_diam_fullres is None:
             if logger is not None:
@@ -77,9 +74,7 @@ def coords_to_micron(
                     platform,
                 )
             return coords.copy()
-        physical_diam = (
-            VISIUM_SPOT_DIAMETER_UM if platform == "visium" else VISIUM_HD_BIN_DIAMETER_UM
-        )
+        physical_diam = VISIUM_SPOT_DIAMETER_UM
         scale = float(physical_diam) / float(spot_diam_fullres)
         if logger is not None:
             logger.info(

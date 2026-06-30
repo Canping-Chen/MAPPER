@@ -6,12 +6,13 @@ between the pieces are documented in :mod:`mapper.api`.
 """
 from __future__ import annotations
 from dataclasses import dataclass, field
+from typing import Optional
 
 
 @dataclass
 class TeacherConfig:
     """Bulk MLP — intrinsic phenotype program."""
-    hidden_dim: int = 256
+    hidden_dim: int = 512
     embed_dim: int = 64
     dropout: float = 0.2
     lr: float = 1e-3
@@ -20,6 +21,19 @@ class TeacherConfig:
     patience: int = 20
     batch_size_max: int = 64
     val_frac: float = 0.2
+    # Two-stage refit policy.  ``refit_full`` is the manual override:
+    #   None  : AUTO (default) — decide from cohort size / balance (see below)
+    #   True  : always run stage-2 full-data refit
+    #   False : never refit; deploy the stage-1 early-stopped model
+    # AUTO rule: refit on ALL bulk samples (for best_epoch+1 epochs, no holdout)
+    # when the cohort is small OR imbalanced — i.e. when ``n_bulk < refit_min_bulk``
+    # OR the minority class/event fraction ``< refit_min_class_frac``.  Only when
+    # n_bulk ≥ refit_min_bulk AND both sides ≥ refit_min_class_frac do we skip the
+    # refit and deploy the stage-1 model (keeping a clean holdout val estimate).
+    # Continuous mode has no class proportion, so only the size criterion applies.
+    refit_full: Optional[bool] = None
+    refit_min_bulk: int = 200
+    refit_min_class_frac: float = 0.10
 
 
 @dataclass
@@ -34,10 +48,9 @@ class GraphConfig:
 class NicheConfig:
     """Niche scoring + likelihood-ratio grouping (spatial mode).
 
-    v0.6 — replaces the quantile-threshold design with a likelihood-ratio
-    classifier that compares per-spot scores against the full bulk training
-    distribution.  Removes the scale mismatch between aggregated bulk and
-    single-spot views.
+    A likelihood-ratio classifier compares per-spot scores against the full
+    bulk training distribution, avoiding the scale mismatch between aggregated
+    bulk and single-spot views.
     """
     # which spatial refinement to use
     #   "pseudo_bulk" : s_niche = teacher_MLP(LOO pseudo-bulk)  [default, interpretable]
@@ -61,9 +74,25 @@ class NicheConfig:
     kde_bandwidth: str = "scott"
     # cap |log_LR| for numerical stability in distribution tails
     log_lr_clip: float = 20.0
-    # Negative-side rule: AND with data-adaptive deepening factor k
-    # (see grouping.NEG_STRICT_CAP and note 30).  No knobs — k is
-    # derived entirely from bulk class sizes.
+    # Negative-side threshold τ_neg is calibrated to a false-omission rate:
+    # at most ``neg_foi_q`` of the bulk positives may fall into the negative
+    # region {log_LR < -τ_neg}.  τ_neg deepens automatically as the bulk
+    # positive / negative score distributions overlap, and is floored at τ.
+    # (see grouping._calibrate_tau_neg)
+    #
+    # Adaptive escalation (same rule for scRNA / spatial, single / multi):
+    # start at the strict ``neg_foi_q``; group; measure the negative fraction
+    # (for scRNA *after* the GMM refinement; for multi-slide *pooled* over all
+    # slides = Σ neg / Σ spots).  While that fraction < ``neg_frac_floor`` the
+    # negative reference is too sparse, so climb the ascending ``neg_foi_q_steps``
+    # ladder one rung at a time (0.01 → 0.025 → 0.05), stopping at the first rung
+    # that meets the floor — or at the last rung if none do.  Then it is fixed,
+    # regardless of the resulting fraction.  ``neg_foi_q`` (an FOI level on the
+    # bulk positives) and ``neg_frac_floor`` (a fraction of the *target* spots)
+    # are independent quantities.
+    neg_foi_q: float = 0.01
+    neg_foi_q_steps: tuple = (0.025, 0.05)
+    neg_frac_floor: float = 0.05
 
 
 @dataclass
@@ -89,25 +118,6 @@ class StudentConfig:
     lambda_smooth: float = 0.1
     neighbor_sizes: tuple = (20, 10)
     minibatch_size: int = 8192
-
-
-@dataclass
-class GroupingConfig:
-    """scRNA Leiden cluster parameters used by ``cluster_phenotype_assign_lr``.
-
-    The default spatial pipeline uses likelihood-ratio thresholds from
-    ``NicheConfig.log_lr_threshold`` and does not read this config.
-    """
-    # expression PCA dimensionality for clustering
-    pca_dim: int = 50
-    # Leiden parameters
-    cluster_n_neighbors: int = 15
-    cluster_resolution: float = 1.0
-    # Cluster-assignment rule: take top-N clusters by mean log_LR_cell and
-    # additionally require each cell's own log_LR_cell to exceed the
-    # NicheConfig.log_lr_threshold.  Top-2 was empirically validated to give
-    # ~99 % cell-type purity on PRAD / HCC while keeping high recall.
-    top_n_clusters: int = 2
 
 
 @dataclass
@@ -150,7 +160,6 @@ class MapperConfig:
     graph: GraphConfig = field(default_factory=GraphConfig)
     niche: NicheConfig = field(default_factory=NicheConfig)
     student: StudentConfig = field(default_factory=StudentConfig)
-    grouping: GroupingConfig = field(default_factory=GroupingConfig)
     vae: VAEConfig = field(default_factory=VAEConfig)
     nbvae: NBVAEConfig = field(default_factory=NBVAEConfig)
     graphvae: GraphVAEConfig = field(default_factory=GraphVAEConfig)

@@ -14,7 +14,7 @@ This is rank-based and therefore scale-invariant.  This score is the
 distillation target for the student GNN.
 
 Optional conditional VAE for batch correction is included but disabled by
-default (only activated when batch_correction=True and batch_key is given).
+default (only activated when a non-null batch_key is given).
 """
 from __future__ import annotations
 import logging
@@ -195,11 +195,6 @@ def _prepare_bulk_y(
             uniq = sorted(np.unique(labels).tolist())
             y = (labels == uniq[-1]).astype(np.float32)
         return y, "binary"
-    if phenotype_type == "multiclass":
-        labels = bulk_meta[class_col].astype(str).to_numpy()
-        uniq = sorted(np.unique(labels).tolist())
-        y = np.array([uniq.index(lbl) for lbl in labels], dtype=np.int64)
-        return y, "multiclass"
     # continuous
     y = bulk_meta[continuous_col].to_numpy(dtype=np.float32)
     return y, "regression"
@@ -208,7 +203,11 @@ def _prepare_bulk_y(
 def _fit_elasticnet(
     bulk_X: np.ndarray, y: np.ndarray, task: str, random_seed: int
 ) -> np.ndarray:
-    """Fit Elastic Net and return coefficient array shape (n_genes,) or (n_classes, n_genes)."""
+    """Fit Elastic Net and return the coefficient array.
+
+    Shape is ``(n_genes,)`` for regression and ``(1, n_genes)`` for the binary
+    classifier.
+    """
     from sklearn.preprocessing import StandardScaler
 
     Xs = StandardScaler().fit_transform(bulk_X)
@@ -231,10 +230,9 @@ def _fit_elasticnet(
         max_iter=2000,
         random_state=random_seed,
         n_jobs=-1,
-        multi_class="ovr",
     )
     m.fit(Xs, y)
-    return m.coef_   # (1, n_genes) binary or (n_classes, n_genes) multiclass
+    return m.coef_   # (1, n_genes), binary
 
 
 # ---------------------------------------------------------------------------
@@ -272,9 +270,11 @@ def normalize_target(
 
     if use_gpu:
         try:
-            import cupy as cp
-            import cupyx.scipy.sparse as cusp 
-            import rapids_singlecell as rsc 
+            # availability probe — the GPU normalizer imports these itself;
+            # a failure here triggers the CPU fallback below.
+            import cupy as cp  # noqa: F401
+            import cupyx.scipy.sparse as cusp  # noqa: F401
+            import rapids_singlecell as rsc  # noqa: F401
             return _normalize_target_gpu(X_sub, log)
         except Exception as e:
             log.warning("[transfer] GPU normalize failed (%s); falling back to CPU.", e)
@@ -340,7 +340,7 @@ def _normalize_target_gpu(X_sub, log) -> np.ndarray:
 
 
 # ---------------------------------------------------------------------------
-# (optional) target-side conditional VAE -- exposed only via batch_correction=True
+# (optional) target-side conditional VAE -- exposed only when batch_key is set
 # ---------------------------------------------------------------------------
 def maybe_correct_with_vae(
     target_X: np.ndarray,
@@ -355,7 +355,7 @@ def maybe_correct_with_vae(
     if not enabled:
         return target_X
     if batch_labels is None:
-        raise ValueError("batch_correction=True requires a batch_key")
+        raise ValueError("batch correction requires non-null batch_labels")
     log = logger or logging.getLogger("MAPPER")
     log.info("[vae] running target-side conditional VAE for batch correction")
     from .vae import fit_conditional_vae   # lazy import; module is light

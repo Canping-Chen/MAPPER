@@ -2,7 +2,7 @@
 MAPPER bulk teacher MLP.
 
 Implements three phenotype heads:
-  - "classification": BCE (binary) / CE (multiclass)
+  - "classification": BCE (binary)
   - "survival"      : Cox partial likelihood (Efron tie handling)
   - "continuous"    : MSE + 0.1 * (1 - Pearson)
 
@@ -131,6 +131,9 @@ class TeacherFitResult:
     out_dim: int
     cls_pos_index: Optional[int] = None
     val_history: list = None
+    refit_full: bool = False        # whether stage-2 full-data refit was run
+    best_epoch: int = -1            # stage-1 epoch (0-based) with best val metric
+    final_epochs: int = -1          # epochs the returned model was trained for
 
 
 def _resolve_phenotype_target(
@@ -147,9 +150,7 @@ def _resolve_phenotype_target(
 
     Returns ``(y, mode, out_dim, pos_index)``.
 
-    For classification we use BCE on binary problems; multiclass collapses
-    to softmax cross-entropy in which case ``pos_index`` is the integer
-    code of ``positive_class``.
+    For classification we use BCE (binary only).
     """
     if phenotype_type == "classification":
         if class_col is None:
@@ -161,14 +162,13 @@ def _resolve_phenotype_target(
                 raise ValueError(
                     f"positive_class={positive_class!r} not found in {class_col} (unique: {uniq})"
                 )
-            if len(uniq) == 2:
-                y = (labels == str(positive_class)).astype(np.float32)
-                return y, "binary", 1, 1
-            # multi-class: treat as softmax CE; signature taken w.r.t. the positive logit
-            mapping = {c: i for i, c in enumerate(uniq)}
-            y = np.array([mapping[v] for v in labels], dtype=np.int64)
-            pos_idx = int(mapping[str(positive_class)])
-            return y, "multiclass", len(uniq), pos_idx
+            if len(uniq) != 2:
+                raise ValueError(
+                    f"phenotype_type='classification' supports binary only "
+                    f"({len(uniq)} unique values found in {class_col})"
+                )
+            y = (labels == str(positive_class)).astype(np.float32)
+            return y, "binary", 1, 1
         # no positive_class given -> assume binary with the rarer class as 1
         if len(uniq) != 2:
             raise ValueError(
@@ -197,6 +197,114 @@ def _resolve_phenotype_target(
         return y, "continuous", 1, None
 
     raise ValueError(f"Unknown phenotype_type: {phenotype_type}")
+
+
+def _stratified_val_split(
+    y: np.ndarray,
+    mode: str,
+    val_frac: float,
+    random_seed: int,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Stratified train / val index split.
+
+    Strata:
+      * ``binary``     -> class label (0/1)
+      * ``survival``   -> event indicator (``y[:, 1]``)
+      * ``continuous`` -> quartile bins of the target value
+
+    Within each stratum a fraction ``val_frac`` (rounded) goes to validation,
+    so the validation set keeps the same class / event / value-range balance as
+    the full cohort — important for rare-event survival and imbalanced binary
+    cohorts where a plain random split can leave val with too few (or zero)
+    positives.  Falls back to a single random holdout if the stratified split
+    would leave train or val empty.
+    """
+    n_b = int(y.shape[0])
+    rng = np.random.default_rng(random_seed)
+
+    if mode == "binary":
+        strata = np.asarray(y, dtype=np.int64).reshape(-1)
+    elif mode == "survival":
+        strata = np.asarray(y[:, 1], dtype=np.int64).reshape(-1)
+    elif mode == "continuous":
+        vals = np.asarray(y, dtype=float).reshape(-1)
+        n_bins = 4 if n_b >= 10 else 1
+        if n_bins <= 1 or np.unique(vals).size < n_bins:
+            strata = np.zeros(n_b, dtype=np.int64)          # degenerate -> random
+        else:
+            edges = np.quantile(vals, [0.25, 0.5, 0.75])
+            strata = np.digitize(vals, edges).astype(np.int64)
+    else:
+        strata = np.zeros(n_b, dtype=np.int64)
+
+    val_mask = np.zeros(n_b, dtype=bool)
+    for s in np.unique(strata):
+        idx = np.where(strata == s)[0]
+        rng.shuffle(idx)
+        n_val_s = int(round(val_frac * idx.size))
+        val_mask[idx[:n_val_s]] = True
+
+    val_idx = np.where(val_mask)[0]
+    tr_idx = np.where(~val_mask)[0]
+
+    # fallback: never return an empty train or val set
+    if val_idx.size == 0 or tr_idx.size == 0:
+        perm = rng.permutation(n_b)
+        n_val = max(1, min(n_b - 1, int(n_b * val_frac)))
+        val_idx = perm[:n_val]
+        tr_idx = perm[n_val:]
+
+    return tr_idx, val_idx
+
+
+def _bce_pos_weight(y_arr: np.ndarray, mode: str, device) -> Optional[torch.Tensor]:
+    """BCE ``pos_weight = N_neg / N_pos`` for binary classification.
+
+    Gives the rarer class proportionally more weight so the loss is not
+    dominated by the majority class.  Symmetric: when positives are the
+    majority the weight is < 1 (down-weights positives, i.e. relatively
+    up-weights the rarer negatives).  Returns ``None`` for non-binary modes or
+    when either class is absent (nothing to balance).
+    """
+    if mode != "binary":
+        return None
+    arr = np.asarray(y_arr).reshape(-1)
+    n_pos = float((arr == 1).sum())
+    n_neg = float((arr == 0).sum())
+    if n_pos <= 0 or n_neg <= 0:
+        return None
+    return torch.tensor(n_neg / n_pos, dtype=torch.float32, device=device)
+
+
+def _minority_frac(y: np.ndarray, mode: str):
+    """Minority class / event fraction in [0, 0.5]; ``None`` for continuous.
+
+    binary   : min(p, 1-p) over the 0/1 labels
+    survival : min(event_rate, 1-event_rate) over y[:,1]
+    continuous: None (no class proportion — only the size criterion applies)
+    """
+    if mode == "binary":
+        r = float(np.mean(np.asarray(y).reshape(-1)))
+        return min(r, 1.0 - r)
+    if mode == "survival":
+        r = float(np.mean(np.asarray(y)[:, 1]))
+        return min(r, 1.0 - r)
+    return None
+
+
+def _decide_refit(y: np.ndarray, mode: str, n_b: int, cfg) -> bool:
+    """Decide whether to run the stage-2 full-data refit.
+
+    ``cfg.refit_full`` overrides when set (True/False); otherwise AUTO: refit
+    when the cohort is small (``n_b < refit_min_bulk``) OR imbalanced (minority
+    fraction ``< refit_min_class_frac``).  Boundaries (==threshold) skip refit.
+    """
+    if cfg.refit_full is not None:
+        return bool(cfg.refit_full)
+    small = n_b < cfg.refit_min_bulk
+    mf = _minority_frac(y, mode)
+    imbalanced = (mf is not None) and (mf < cfg.refit_min_class_frac)
+    return small or imbalanced
 
 
 def fit_teacher(
@@ -230,27 +338,15 @@ def fit_teacher(
         continuous_col=continuous_col,
     )
 
-    # train / val split
-    rng = np.random.default_rng(random_seed)
-    perm = rng.permutation(n_b)
-    n_val = max(1, int(n_b * cfg.val_frac))
-    val_idx = perm[:n_val]
-    tr_idx = perm[n_val:]
+    # stratified train / val split (by class / event / value-quartile)
+    tr_idx, val_idx = _stratified_val_split(y, mode, cfg.val_frac, random_seed)
+    n_val = int(val_idx.size)
 
     Xtr = torch.as_tensor(bulk_X[tr_idx], dtype=torch.float32, device=device)
     Xva = torch.as_tensor(bulk_X[val_idx], dtype=torch.float32, device=device)
-    if mode == "multiclass":
-        ytr = torch.as_tensor(y[tr_idx], dtype=torch.long, device=device)
-        yva = torch.as_tensor(y[val_idx], dtype=torch.long, device=device)
-    elif mode == "binary":
-        ytr = torch.as_tensor(y[tr_idx], dtype=torch.float32, device=device)
-        yva = torch.as_tensor(y[val_idx], dtype=torch.float32, device=device)
-    elif mode == "survival":
-        ytr = torch.as_tensor(y[tr_idx], dtype=torch.float32, device=device)
-        yva = torch.as_tensor(y[val_idx], dtype=torch.float32, device=device)
-    else:  # continuous
-        ytr = torch.as_tensor(y[tr_idx], dtype=torch.float32, device=device)
-        yva = torch.as_tensor(y[val_idx], dtype=torch.float32, device=device)
+    # Targets are encoded identically across modes; the validation metric reads
+    # y[val_idx] directly (numpy), so only the training-side tensor is needed.
+    ytr = torch.as_tensor(y[tr_idx], dtype=torch.float32, device=device)
 
     model = TeacherMLP(
         n_genes=n_g,
@@ -263,14 +359,13 @@ def fit_teacher(
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=cfg.max_epochs)
 
     bs = min(cfg.batch_size_max, max(8, int(math.ceil(len(tr_idx) / 4))))
+    pos_weight_tr = _bce_pos_weight(y[tr_idx], mode, device)
 
-    def _loss(out, target, mode):
+    def _loss(out, target, mode, pos_weight=None):
         if mode == "binary":
             return torch.nn.functional.binary_cross_entropy_with_logits(
-                out.view(-1), target.view(-1)
+                out.view(-1), target.view(-1), pos_weight=pos_weight
             )
-        if mode == "multiclass":
-            return torch.nn.functional.cross_entropy(out, target)
         if mode == "survival":
             time = target[:, 0]; event = target[:, 1]
             return _cox_partial_likelihood_efron(out.view(-1), time, event)
@@ -288,10 +383,6 @@ def fit_teacher(
             if mode == "binary":
                 p = torch.sigmoid(out.view(-1))
                 return _auroc(p.cpu().numpy(), y[val_idx])
-            if mode == "multiclass":
-                p = torch.softmax(out, dim=1)
-                pred = p.argmax(dim=1).cpu().numpy()
-                return float((pred == y[val_idx]).mean())
             if mode == "survival":
                 risk = out.view(-1).cpu().numpy()
                 t = y[val_idx, 0]; e = y[val_idx, 1]
@@ -302,10 +393,11 @@ def fit_teacher(
 
     best = (-math.inf if mode != "survival" else -math.inf)
     best_sd = {k: v.detach().clone() for k, v in model.state_dict().items()}
+    best_epoch = 0
     bad_epochs = 0
     history = []
     metric_name = {
-        "binary": "AUROC", "multiclass": "Acc", "survival": "C-index", "continuous": "Pearson",
+        "binary": "AUROC", "survival": "C-index", "continuous": "Pearson",
     }[mode]
 
     for ep in range(cfg.max_epochs):
@@ -319,7 +411,7 @@ def fit_teacher(
             yb = ytr[ix]
             opt.zero_grad()
             out, _ = model(xb)
-            loss = _loss(out, yb, mode)
+            loss = _loss(out, yb, mode, pos_weight_tr)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
             opt.step()
@@ -330,6 +422,7 @@ def fit_teacher(
         history.append({"epoch": ep, "train_loss": ep_loss / max(n_batches, 1), "val": m})
         if m > best + 1e-6:
             best = m
+            best_epoch = ep
             best_sd = {k: v.detach().clone() for k, v in model.state_dict().items()}
             bad_epochs = 0
         else:
@@ -337,13 +430,51 @@ def fit_teacher(
             if bad_epochs >= cfg.patience:
                 break
 
-    model.load_state_dict(best_sd)
+    # ---- Stage 2: optional refit on ALL bulk samples ----
+    # Reuse the early-stopping point (best_epoch) found on the holdout, but
+    # train a fresh model from scratch on every labelled sample for that many
+    # epochs (no val, no early stopping). The LR schedule keeps the same
+    # T_max so each epoch's learning rate matches stage 1.
+    final_epochs = best_epoch + 1
+    refit_done = False
+    do_refit = _decide_refit(y, mode, n_b, cfg)
+    if do_refit and n_b > n_val:
+        torch.manual_seed(random_seed)
+        Xall = torch.as_tensor(bulk_X, dtype=torch.float32, device=device)
+        yall = torch.as_tensor(y, dtype=torch.float32, device=device)
+        model = TeacherMLP(
+            n_genes=n_g, out_dim=out_dim,
+            hidden_dim=cfg.hidden_dim, embed_dim=cfg.embed_dim, dropout=cfg.dropout,
+        ).to(device)
+        opt = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
+        sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=cfg.max_epochs)
+        bs_all = min(cfg.batch_size_max, max(8, int(math.ceil(n_b / 4))))
+        pos_weight_all = _bce_pos_weight(y, mode, device)
+        for ep in range(final_epochs):
+            model.train()
+            perm_all = torch.randperm(n_b, device=device)
+            for s in range(0, n_b, bs_all):
+                ix = perm_all[s : s + bs_all]
+                xb = Xall[ix]
+                yb = yall[ix]
+                opt.zero_grad()
+                out, _ = model(xb)
+                loss = _loss(out, yb, mode, pos_weight_all)
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
+                opt.step()
+            sched.step()
+        refit_done = True
+    else:
+        # keep the stage-1 best-on-val weights (deploy early-stopped model)
+        model.load_state_dict(best_sd)
+
     for p in model.parameters():
         p.requires_grad = False
 
     log.info(
-        "[teacher] mode=%s n_b=%d n_g=%d epochs=%d best %s=%.4f",
-        mode, n_b, n_g, len(history), metric_name, best,
+        "[teacher] mode=%s n_b=%d n_g=%d stage1_epochs=%d best_epoch=%d best %s=%.4f",
+        mode, n_b, n_g, len(history), best_epoch, metric_name, best,
     )
     return TeacherFitResult(
         model=model,
@@ -352,6 +483,9 @@ def fit_teacher(
         out_dim=out_dim,
         cls_pos_index=pos_idx,
         val_history=history,
+        refit_full=refit_done,
+        best_epoch=int(best_epoch),
+        final_epochs=int(final_epochs) if refit_done else len(history),
     )
 
 

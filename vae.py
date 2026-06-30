@@ -1,8 +1,8 @@
 """
 Optional conditional VAE for target-side technical batch correction.
 
-Invoked when ``mapper(..., batch_correction=True, batch_key=...)`` or
-``mapper_multi_slide(..., batch_correction=True, batch_key=...)``.
+Invoked when ``mapper(..., batch_key=...)`` or
+``mapper_multi_slide(..., batch_key=...)``.
 
 Caller note: passing a ``batch_key`` whose values are 1:1 with ``slide_id``
 will let the conditional VAE erase ALL cross-slide variation -- including
@@ -53,26 +53,6 @@ class _ConditionalVAE(nn.Module):
         return x_rec, mu, lv, z
 
 
-class _ConditionalVAERefDecoder(nn.Module):
-    """Encode with original batch one-hot and decode under a fixed reference batch.
-
-    This small wrapper lets DataParallel split the correction/decode pass across
-    GPUs, because DataParallel only parallelizes ``forward``.
-    """
-    def __init__(self, core: _ConditionalVAE, n_batches: int, ref_idx: int):
-        super().__init__()
-        self.core = core
-        self.n_batches = int(n_batches)
-        self.ref_idx = int(ref_idx)
-
-    def forward(self, x, b_oh):
-        h = self.core.enc(torch.cat([x, b_oh], dim=-1))
-        mu = self.core.mu(h)
-        ref_oh = torch.zeros((x.size(0), self.n_batches), dtype=x.dtype, device=x.device)
-        ref_oh[:, self.ref_idx] = 1.0
-        return self.core.dec(torch.cat([mu, ref_oh], dim=-1))
-
-
 def _batch_aligns_with_slide(batch_labels: np.ndarray,
                              slide_ids: np.ndarray) -> bool:
     """True iff batch_labels and slide_ids define the same partition
@@ -97,19 +77,6 @@ def fit_conditional_vae(
     device: Optional[torch.device] = None,
     logger: Optional[logging.Logger] = None,
 ) -> np.ndarray:
-    """Conditional VAE batch correction with CPU-resident matrix and optional multi-GPU.
-
-    Important design choice for large scRNA/stRNA data:
-      - Do NOT move the full (N, G) target_X to CUDA.
-      - Keep target_X on CPU as a torch Tensor view of the numpy array.
-      - Move only the current mini-batch to GPU.
-      - If multiple CUDA devices are visible, wrap the model in DataParallel so each
-        mini-batch is split across GPUs.
-
-    This fixes the previous OOM pattern:
-        X = torch.as_tensor(target_X, ..., device='cuda')
-    which tried to allocate N * G * 4 bytes on cuda:0.
-    """
     cfg = config or VAEConfig()
     log = logger or logging.getLogger("MAPPER")
     if device is None:
@@ -121,125 +88,64 @@ def fit_conditional_vae(
                     "biology (e.g. tumor content). Proceed only if slides are "
                     "technical replicates.")
 
-    # ---- encode batches ----
-    target_X = np.asarray(target_X, dtype=np.float32, order="C")
     N, G = target_X.shape
     uniq, inv = np.unique(batch_labels, return_inverse=True)
     B = len(uniq)
     if B < 2:
         log.info("[vae] only one batch -- skipping correction.")
         return target_X
-
+    one_hot = np.zeros((N, B), dtype=np.float32)
+    one_hot[np.arange(N), inv] = 1.0
     ref_idx = int(np.argmax(np.bincount(inv)))
     log.info("[vae] N=%d G=%d B=%d ref_batch=%s", N, G, B, uniq[ref_idx])
 
-    # ---- choose device / optional DataParallel ----
-    use_cuda = (device.type == "cuda") and torch.cuda.is_available()
-    n_cuda = torch.cuda.device_count() if use_cuda else 0
-    if use_cuda:
-        # Make the requested device the primary device for DataParallel output/loss.
-        primary_idx = int(device.index) if device.index is not None else torch.cuda.current_device()
-        torch.cuda.set_device(primary_idx)
-        device_ids = list(range(n_cuda))
-        if primary_idx in device_ids:
-            device_ids = [primary_idx] + [i for i in device_ids if i != primary_idx]
-    else:
-        primary_idx = None
-        device_ids = []
-
-    model_core = _ConditionalVAE(G, B, cfg.hidden_dim, cfg.latent_dim, cfg.dropout).to(device)
-    if use_cuda and len(device_ids) > 1:
-        model = nn.DataParallel(model_core, device_ids=device_ids, output_device=primary_idx)
-        log.info("[vae] using DataParallel on visible CUDA devices: %s", device_ids)
-    else:
-        model = model_core
-        log.info("[vae] using device=%s", device)
-
+    X = torch.as_tensor(target_X, dtype=torch.float32, device=device)
+    OH = torch.as_tensor(one_hot, dtype=torch.float32, device=device)
+    model = _ConditionalVAE(G, B, cfg.hidden_dim, cfg.latent_dim, cfg.dropout).to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=1e-5)
 
-    # Keep the full matrix on CPU. torch.as_tensor shares memory with numpy when possible.
-    # Do NOT call pin_memory() on the full matrix by default: for million-cell data it
-    # may create a second ~80 GiB pinned copy. Batch tensors are transferred to GPU.
-    X_cpu = torch.as_tensor(target_X, dtype=torch.float32)
-    batch_cpu = torch.as_tensor(inv.astype(np.int64, copy=False), dtype=torch.long)
-
-    # Optional user override: cfg.batch_size; otherwise keep previous heuristic.
-    bs = int(getattr(cfg, "batch_size", max(256, min(8192, N // 50 + 1))))
-    bs = max(1, bs)
-    log.info("[vae] batch_size=%d; full matrix stays on CPU; GPU receives mini-batches only", bs)
-
-    best = float("inf")
-    bad = 0
-    best_sd = {k: v.detach().cpu().clone() for k, v in model_core.state_dict().items()}
-
-    # ---- train ----
+    bs = max(256, min(8192, N // 50 + 1))
+    best = float("inf"); bad = 0
+    best_sd = {k: v.detach().clone() for k, v in model.state_dict().items()}
     for ep in range(cfg.max_epochs):
         model.train()
-        perm = torch.randperm(N)  # CPU permutation avoids allocating N indices on CUDA.
+        perm = torch.randperm(N, device=device)
         ep_loss = 0.0
-        nb = 0
         for s in range(0, N, bs):
-            ix = perm[s:s + bs]
-            xb = X_cpu.index_select(0, ix).to(device, non_blocking=True)
-            bidx = batch_cpu.index_select(0, ix).to(device, non_blocking=True)
-            ob = torch.zeros((bidx.numel(), B), dtype=torch.float32, device=device)
-            ob.scatter_(1, bidx.view(-1, 1), 1.0)
-
-            opt.zero_grad(set_to_none=True)
+            ix = perm[s : s + bs]
+            xb = X[ix]; ob = OH[ix]
+            opt.zero_grad()
             x_rec, mu, lv, _ = model(xb, ob)
             recon = ((xb - x_rec) ** 2).mean()
             kl = -0.5 * (1 + lv - mu.pow(2) - lv.exp()).mean()
             loss = recon + cfg.kl_weight * kl
-            loss.backward()
-            opt.step()
-
+            loss.backward(); opt.step()
             ep_loss += float(loss.detach().cpu())
-            nb += 1
-
-            # aggressively drop per-batch tensors before next transfer
-            del xb, bidx, ob, x_rec, mu, lv, loss
-
-        ep_loss /= max(nb, 1)
         if ep_loss < best - 1e-6:
-            best = ep_loss
-            bad = 0
-            best_sd = {k: v.detach().cpu().clone() for k, v in model_core.state_dict().items()}
+            best = ep_loss; bad = 0
+            best_sd = {k: v.detach().clone() for k, v in model.state_dict().items()}
         else:
             bad += 1
             if bad >= cfg.patience:
-                log.info("[vae] early stop at epoch=%d best_loss=%.6f", ep, best)
                 break
+    model.load_state_dict(best_sd)
 
-    model_core.load_state_dict(best_sd)
-
-    # ---- decode all cells with reference batch one-hot ----
-    # Use a forward wrapper so the correction/decode pass can also be split by
-    # DataParallel. The full matrix still stays on CPU.
-    model_core.eval()
-    decode_core = _ConditionalVAERefDecoder(model_core, B, ref_idx).to(device)
-    if use_cuda and len(device_ids) > 1:
-        decode_model = nn.DataParallel(decode_core, device_ids=device_ids, output_device=primary_idx)
-    else:
-        decode_model = decode_core
-    decode_model.eval()
-
+    # decode all cells with the reference batch one-hot
+    model.eval()
+    ref_oh = torch.zeros((N, B), dtype=torch.float32, device=device)
+    ref_oh[:, ref_idx] = 1.0
     out = np.empty((N, G), dtype=np.float32)
     with torch.no_grad():
         for s in range(0, N, bs):
             e = min(s + bs, N)
-            xb = X_cpu[s:e].to(device, non_blocking=True)
-            bidx = batch_cpu[s:e].to(device, non_blocking=True)
-            ob = torch.zeros((e - s, B), dtype=torch.float32, device=device)
-            ob.scatter_(1, bidx.view(-1, 1), 1.0)
-
-            x_corr = decode_model(xb, ob)
-            out[s:e] = x_corr.detach().cpu().numpy()
-
-            del xb, bidx, ob, x_corr
-
-    if use_cuda:
-        torch.cuda.empty_cache()
-    log.info("[vae] correction done. best_loss=%.6f", best)
+            xb = X[s:e]; ob = OH[s:e]
+            h = model.enc(torch.cat([xb, ob], dim=-1))
+            mu = model.mu(h)
+            zr = mu  # use mean (deterministic)
+            zb = torch.cat([zr, ref_oh[s:e]], dim=-1)
+            x_corr = model.dec(zb)
+            out[s:e] = x_corr.cpu().numpy()
+    log.info("[vae] correction done.")
     return out
 
 

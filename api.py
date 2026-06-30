@@ -18,16 +18,25 @@ Spatial / stRNA mode
     log_LR_cell  = log p(s_cell  | bulk_pos) - log p(s_cell  | bulk_neg)
     log_LR_niche = log p(s_niche | bulk_pos) - log p(s_niche | bulk_neg)
 
-    τ_neg = τ × k,  k = min( (max(P,N)/min(P,N)) × (1 + 2·P/(P+N)), 5 )
-    where P, N are bulk pos / neg sample counts (Option C, see note 30).
+    τ_neg = max( τ, -quantile_q( log_LR | bulk_pos ) )
+    i.e. τ_neg is calibrated so that at most q (=neg_foi_q) of the bulk positives
+    fall into the negative region {log_LR < -τ_neg}.  It deepens automatically as
+    the bulk pos / neg score distributions overlap, and is floored at τ
+    (well-separated cohorts stay symmetric).  q starts at 0.01 and is escalated
+    along (0.01, 0.025, 0.05) while the negative fraction stays below
+    neg_frac_floor (see _choose_foi_q_and_group).
 
     pos = (log_LR_cell  > +τ)    OR  (log_LR_niche > +τ)
     neg = (log_LR_cell  < -τ_neg) AND (log_LR_niche < -τ_neg)  AND not pos
     bg  = otherwise
 
 scRNA mode
-    No physical graph.  Leiden cluster on expression PCA, then mark every
-    cluster whose mean ``log_LR_cell`` exceeds the threshold as positive.
+    No physical graph and no niche tier.  Grouping reuses the same
+    likelihood-ratio thresholding with ``log_LR_niche`` absent::
+
+        pos = (log_LR_cell > +τ)
+        neg = (log_LR_cell < -τ_neg)  AND not pos
+        bg  = otherwise
 
 Outputs
 -------
@@ -84,10 +93,7 @@ from .niche import (
     log_likelihood_ratio,
 )
 from .student import fit_student_distill
-from .grouping import (
-    likelihood_ratio_3class,
-    cluster_phenotype_assign_lr,
-)
+from .grouping import likelihood_ratio_3class, refine_groups_bimodal
 
 
 # ---------------------------------------------------------------------------
@@ -109,18 +115,19 @@ def mapper(
     spatial_radius_um: Optional[float] = None,
     random_seed: int = 42,
     verbose: bool = True,
-    batch_correction: bool = False,
+    reconstruct: bool = False,
     batch_key: Optional[str] = None,
     _config: Optional[_cfg.MapperConfig] = None,
 ):
     """Run MAPPER on a single AnnData."""
     cfg = _config or _cfg.DEFAULT
+    do_reconstruct = reconstruct or cfg.reconstruct
     log = get_logger(verbose)
     set_seed(random_seed)
 
     if data_mode not in {"spatial", "scRNA"}:
         raise ValueError(f"data_mode must be 'spatial' or 'scRNA', got {data_mode!r}")
-    if platform not in {"visium", "visium_hd", "xenium", "generic", "scRNA"}:
+    if platform not in {"visium", "xenium", "generic", "scRNA"}:
         raise ValueError(f"unsupported platform: {platform!r}")
 
     log.info("=" * 60)
@@ -155,7 +162,7 @@ def mapper(
     use_gpu = gpu_available() and adata.n_obs >= cfg.graph.gpu_n_threshold
     target_X = normalize_target(adata, target_idx, use_gpu=use_gpu, logger=log)
 
-    if cfg.reconstruct:
+    if do_reconstruct:
         target_X = maybe_reconstruct(
             adata, target_X, target_idx, data_mode,
             enabled=True, platform=platform,
@@ -165,9 +172,8 @@ def mapper(
 
     target_X_z, _, _ = zscore_columns(target_X, clip=10.0)
 
-    if batch_correction:
-        if batch_key is None:
-            raise ValueError("batch_correction=True requires batch_key")
+    # batch correction is enabled simply by passing a non-null batch_key
+    if batch_key is not None:
         if batch_key not in adata.obs.columns:
             raise ValueError(f"batch_key={batch_key!r} not in adata.obs")
         batch_labels = adata.obs[batch_key].to_numpy()
@@ -212,8 +218,8 @@ def mapper(
         bulk_pos_scores = bulk_neg_scores = None
         bulk_dist_info = {"error": str(e)}
 
-    # ---- 5-9. Score + group this slide ----
-    out = _score_and_group_one_slide(
+    # ---- 5-9. Score this slide, choose negative-side FOI, group, write obs ----
+    payload = _score_one_slide(
         adata=adata, target_X_z=target_X_z,
         teacher_res=teacher_res,
         bulk_pos_scores=bulk_pos_scores, bulk_neg_scores=bulk_neg_scores,
@@ -221,6 +227,24 @@ def mapper(
         spatial_radius_um=spatial_radius_um,
         device=device, random_seed=random_seed, logger=log,
     )
+    groups_list, meta_list = _choose_foi_q_and_group(
+        [payload], cfg=cfg, data_mode=data_mode,
+        random_seed=random_seed, logger=log,
+    )
+    groups, group_meta = groups_list[0], meta_list[0]
+    adata.obs["MAPPER.Score"] = np.asarray(payload["s_final"], dtype=float)
+    adata.obs["MAPPER.Group"] = pd.Categorical(
+        groups, categories=["negative", "background", "positive"], ordered=True,
+    )
+    out = {
+        "ran_spatial": payload["ran_spatial"],
+        "refinement": payload["refinement"],
+        "refine_alpha": payload["refine_alpha"],
+        "s_final": payload["s_final"],
+        "groups": groups,
+        "group_meta": group_meta,
+        "per_cell": payload["per_cell"],
+    }
 
     # release target_X_z
     try:
@@ -275,7 +299,7 @@ def mapper_multi_slide(
     random_seed: int = 42,
     verbose: bool = True,
     return_concat: bool = True,
-    batch_correction: bool = False,
+    reconstruct: bool = False,
     batch_key: Optional[str] = None,
     _config: Optional[_cfg.MapperConfig] = None,
 ):
@@ -299,7 +323,7 @@ def mapper_multi_slide(
             relative ranking only; cross-slide content differences are
             erased).
 
-      * ``cfg.reconstruct`` (default ``False``):
+      * ``reconstruct`` (default ``False``):
             per-slide GraphVAE denoising of low-quality slides.  Cross-slide
             edges are blocked inside ``build_spatial_graph`` via ``slide_id``,
             so each slide is denoised within its own spatial topology.
@@ -310,7 +334,7 @@ def mapper_multi_slide(
 
     Batch correction
     ----------------
-    ``batch_correction=True`` + ``batch_key='<obs column>'`` enables a global
+    Passing ``batch_key='<obs column>'`` (non-null) enables a global
     conditional VAE over all slides concatenated.  The VAE handles both
     cross-slide batches (each slide a single batch) and within-slide batches
     (multiple batches per slide) uniformly — only ``batch_labels`` matter.
@@ -327,6 +351,7 @@ def mapper_multi_slide(
     import anndata as ad
     log = get_logger(verbose)
     cfg = _config or _cfg.DEFAULT
+    do_reconstruct = reconstruct or cfg.reconstruct
     set_seed(random_seed)
     log.info("=" * 60)
     log.info("MAPPER v0.7 multi-slide  N_slides=%d  platform=%s",
@@ -347,7 +372,7 @@ def mapper_multi_slide(
             sid = f"{base}_{k}"; k += 1
         used_ids.append(sid)
         a2.obs["slide_id"] = sid
-        if platform in {"visium", "visium_hd"}:
+        if platform == "visium":
             coords_um = coords_to_micron(a2, platform, logger=log)
             if coords_um is not None:
                 a2.obsm["spatial"] = coords_um.astype(np.float32)
@@ -388,24 +413,22 @@ def mapper_multi_slide(
 
     norm_mode = str(cfg.multi_slide_normalization).lower()
     if norm_mode not in {"per_slide", "joint"}:
-        raise ValueError(f"multi_slide_normalization must be one of "
+        raise ValueError("multi_slide_normalization must be one of "
                          "{joint, per_slide}; got %r" % norm_mode)
     # reconstruct + joint is unsupported in v1 (joint stats would need a
     # second pass after reconstruction); fall back to per_slide with a warn.
-    if cfg.reconstruct and norm_mode == "joint":
+    if do_reconstruct and norm_mode == "joint":
         log.warning("[multi] reconstruct=True + multi_slide_normalization='joint' "
                     "is not supported in v1; falling back to 'per_slide'.")
         norm_mode = "per_slide"
     log.info("[multi] target normalisation mode: %s", norm_mode)
 
-    # batch_correction validation
-    if batch_correction:
-        if batch_key is None:
-            raise ValueError("batch_correction=True requires batch_key")
+    # batch correction is enabled simply by passing a non-null batch_key
+    if batch_key is not None:
         for sid, a in zip(used_ids, prepared):
             if batch_key not in a.obs.columns:
                 raise ValueError(f"batch_key={batch_key!r} missing in slide {sid!r}")
-        log.info("[multi] batch_correction enabled (key=%r)", batch_key)
+        log.info("[multi] batch correction enabled (key=%r)", batch_key)
 
     # ---- 3. Train teacher ONCE ----
     device = auto_device()
@@ -441,21 +464,21 @@ def mapper_multi_slide(
     tau = float(cfg.niche.log_lr_threshold)
     refine_method = cfg.niche.refine_method
 
-    # ---- 5a. batch_correction pre-pass (if enabled) ----
-    # When batch_correction is on, we must collect all per-slide target_X
+    # ---- 5a. batch correction pre-pass (if batch_key is set) ----
+    # When batch correction is on, we must collect all per-slide target_X
     # (post-normalize, post-reconstruct) in RAM so the conditional VAE sees
     # the full cross-slide distribution.  Cache is then consumed by the
     # joint-stats pass (5b) and the main per-slide loop (5c).
-    target_X_cache = {}   # sid -> np.ndarray  (only populated if batch_correction)
+    target_X_cache = {}   # sid -> np.ndarray  (only populated if batch_key set)
     MAX_CONCAT_GB = 10.0  # memory budget for the global VAE concat
-    if batch_correction:
+    if batch_key is not None:
         log.info("[multi.vae] pre-collecting per-slide target_X for global VAE")
         for sid, a in zip(used_ids, prepared):
             var_pos_a = pd.Series(np.arange(a.n_vars), index=a.var_names)
             idx_a = var_pos_a.loc[shared_genes].values.astype(np.int64)
             use_gpu_a = gpu_available() and a.n_obs >= cfg.graph.gpu_n_threshold
             tx = normalize_target(a, idx_a, use_gpu=use_gpu_a, logger=log)
-            if cfg.reconstruct:
+            if do_reconstruct:
                 tx = maybe_reconstruct(
                     adata=a, target_X=tx, target_idx=idx_a,
                     data_mode="spatial", enabled=True, platform=platform,
@@ -511,7 +534,7 @@ def mapper_multi_slide(
     joint_mean = joint_std = None
     if norm_mode == "joint":
         if target_X_cache:
-            # batch_correction populated the cache; compute stats from corrected
+            # batch correction populated the cache; compute stats from corrected
             log.info("[multi] joint-mode: stats from batch-corrected matrices")
             all_X = np.concatenate(
                 [target_X_cache[s] for s in used_ids], axis=0,
@@ -545,9 +568,8 @@ def mapper_multi_slide(
                  float(joint_mean.min()), float(joint_mean.max()),
                  float(joint_std.min()), float(joint_std.max()))
 
-    # ---- 5c. per-slide loop using shared _score_and_group_one_slide ----
-    processed = []
-    per_slide_meta = {}
+    # ---- 5c. per-slide scoring (FOI-independent; teacher inference + niche) ----
+    payloads = []
     for sid, a in zip(used_ids, prepared):
         log.info("-" * 60)
         log.info("[multi.slide] %s  N=%d", sid, a.n_obs)
@@ -557,7 +579,7 @@ def mapper_multi_slide(
         target_idx = var_pos.loc[shared_genes].values.astype(np.int64)
 
         if sid in target_X_cache:
-            # batch_correction pre-pass already produced corrected target_X
+            # batch correction pre-pass already produced corrected target_X
             target_X = target_X_cache.pop(sid)
         else:
             # CPM normalise (per-slide, adaptive GPU)
@@ -567,7 +589,7 @@ def mapper_multi_slide(
 
             # per-slide reconstruction (GraphVAE for spatial; cross-slide edges
             # are blocked inside build_spatial_graph via slide_id).
-            if cfg.reconstruct:
+            if do_reconstruct:
                 target_X = maybe_reconstruct(
                     adata=a, target_X=target_X, target_idx=target_idx,
                     data_mode="spatial", enabled=True, platform=platform,
@@ -586,34 +608,46 @@ def mapper_multi_slide(
         del target_X
         gc.collect()
 
-        # delegate to shared helper
-        out = _score_and_group_one_slide(
+        payloads.append(_score_one_slide(
             adata=a, target_X_z=target_X_z,
             teacher_res=teacher_res,
             bulk_pos_scores=bulk_pos_scores, bulk_neg_scores=bulk_neg_scores,
             cfg=cfg, data_mode="spatial", platform=platform,
             spatial_radius_um=spatial_radius_um,
             device=device, random_seed=random_seed, logger=log,
-            multi_slide_mode=True,   # disables GNN distill (use pseudo_bulk only)
-        )
-        # target_X_z freed inside helper
+            multi_slide_mode=True,   # coords already in micron; skip pixel→micron + slide_id split
+        ))
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
+    # ---- 5d. shared negative-side FOI choice (pooled over all slides), group ----
+    groups_list, meta_list = _choose_foi_q_and_group(
+        payloads, cfg=cfg, data_mode="spatial",
+        random_seed=random_seed, logger=log,
+    )
+
+    processed = []
+    per_slide_meta = {}
+    for sid, a, payload, groups, group_meta in zip(
+        used_ids, prepared, payloads, groups_list, meta_list
+    ):
+        a.obs["MAPPER.Score"] = np.asarray(payload["s_final"], dtype=float)
+        a.obs["MAPPER.Group"] = pd.Categorical(
+            groups, categories=["negative", "background", "positive"], ordered=True,
+        )
         per_slide_meta[sid] = {
             "n_obs": int(a.n_obs),
-            "spatial_used": bool(out["ran_spatial"]),
-            "per_cell": out["per_cell"],
-            "group_meta": out["group_meta"],
-            "s_cell_mean": float(out["per_cell"]["s_cell"].mean()),
-            "s_cell_std":  float(out["per_cell"]["s_cell"].std()),
+            "spatial_used": bool(payload["ran_spatial"]),
+            "per_cell": payload["per_cell"],
+            "group_meta": group_meta,
+            "s_cell_mean": float(payload["per_cell"]["s_cell"].mean()),
+            "s_cell_std":  float(payload["per_cell"]["s_cell"].std()),
         }
-        groups = out["groups"]
         log.info("[multi.slide] %s done. groups=%s",
                  sid,
                  {k: int((groups == k).sum()) for k in
                   ["negative", "background", "positive"]})
         processed.append(a)
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
 
     # ---- 6. Merge per-slide AnnData into one ----
     merged = ad.concat(
@@ -665,7 +699,7 @@ def mapper_multi_slide(
 # ---------------------------------------------------------------------------
 # shared per-slide score + group helper (used by mapper and mapper_multi_slide)
 # ---------------------------------------------------------------------------
-def _score_and_group_one_slide(
+def _score_one_slide(
     adata,
     target_X_z: np.ndarray,
     teacher_res,
@@ -681,7 +715,13 @@ def _score_and_group_one_slide(
     logger,
     multi_slide_mode: bool = False,
 ) -> dict:
-    """Score + group a single slide given (pre-trained) teacher + KDE refs.
+    """Score (not group) a single slide given (pre-trained) teacher + KDE refs.
+
+    Runs the expensive, FOI-independent part — teacher inference, optional
+    spatial niche, and the per-spot / bulk-positive log-LRs — and returns a
+    payload.  Grouping is left to :func:`_group_one_slide` /
+    :func:`_choose_foi_q_and_group` so the negative-side FOI level can be chosen
+    adaptively (and, for multi-slide, pooled across slides).
 
     Pre-conditions
     --------------
@@ -690,11 +730,9 @@ def _score_and_group_one_slide(
       (single-slide ``mapper`` uses per-slide z-score; multi-slide uses joint
       or per-slide depending on ``cfg.multi_slide_normalization``).
     * ``teacher_res.model`` and the bulk KDE arrays are computed once and
-      passed in so this function is purely inference + grouping.
+      passed in so this function is purely inference.
 
-    Side-effects
-    ------------
-    * Writes ``adata.obs['MAPPER.Score']`` and ``adata.obs['MAPPER.Group']``.
+    Side-effects: none (obs columns are written by the caller after grouping).
     """
     log = logger or logging.getLogger("MAPPER")
     distributions_ok = bulk_pos_scores is not None and bulk_neg_scores is not None
@@ -711,14 +749,7 @@ def _score_and_group_one_slide(
              float(np.nanmean(s_cell_raw)), float(np.nanstd(s_cell_raw)),
              float(s_cell_raw.min()), float(s_cell_raw.max()))
 
-    # 2. Expression PCA for scRNA Leiden grouping
-    expr_pca = None
-    if data_mode == "scRNA":
-        expr_pca = _expression_pca(
-            target_X_z, n_components=cfg.grouping.pca_dim, logger=log,
-        )
-
-    # 3. Spatial niche (spatial mode only)
+    # 2. Spatial niche (spatial mode only)
     ran_spatial = False
     s_niche_raw = np.zeros_like(s_cell_raw)
     refinement = "none"
@@ -792,36 +823,17 @@ def _score_and_group_one_slide(
         log_lr_cell = np.zeros_like(s_cell_raw)
         log_lr_niche = np.zeros_like(s_niche_raw)
 
-    # 6. Grouping
-    tau = float(cfg.niche.log_lr_threshold)
-    bulk_P = int(bulk_pos_scores.size) if bulk_pos_scores is not None else None
-    bulk_N = int(bulk_neg_scores.size) if bulk_neg_scores is not None else None
-    if data_mode == "scRNA":
-        if expr_pca is None or not distributions_ok:
-            log.warning("[score] expr_pca / distributions unavailable; cell-only fallback")
-            groups, group_meta = likelihood_ratio_3class(
-                log_lr_cell, None, log_lr_threshold=tau,
-                bulk_pos_size=bulk_P, bulk_neg_size=bulk_N, logger=log,
-            )
-        else:
-            groups, group_meta = cluster_phenotype_assign_lr(
-                log_lr_cell, expr_pca,
-                log_lr_threshold=tau,
-                bulk_pos_size=bulk_P, bulk_neg_size=bulk_N,
-                config=cfg.grouping, random_seed=random_seed, logger=log,
-            )
-    else:
-        groups, group_meta = likelihood_ratio_3class(
-            log_lr_cell, log_lr_niche if ran_spatial else None,
-            log_lr_threshold=tau,
-            bulk_pos_size=bulk_P, bulk_neg_size=bulk_N, logger=log,
+    # 6. Bulk-positive log-LR reference for τ_neg calibration (FOI-independent;
+    #    the same KDE pair is reused).  Grouping itself is deferred to the caller
+    #    so the negative-side FOI level can be chosen adaptively.
+    if distributions_ok:
+        bulk_pos_loglr = log_likelihood_ratio(
+            bulk_pos_scores, bulk_pos_scores, bulk_neg_scores,
+            bandwidth=cfg.niche.kde_bandwidth,
+            clip=cfg.niche.log_lr_clip, logger=log,
         )
-
-    # 7. Write per-slide obs (2 columns only)
-    adata.obs["MAPPER.Score"] = np.asarray(s_final, dtype=float)
-    adata.obs["MAPPER.Group"] = pd.Categorical(
-        groups, categories=["negative", "background", "positive"], ordered=True,
-    )
+    else:
+        bulk_pos_loglr = None
 
     per_cell = {
         "s_cell":  np.asarray(s_cell_raw, dtype=np.float32),
@@ -836,10 +848,125 @@ def _score_and_group_one_slide(
         "refinement": refinement,
         "refine_alpha": alpha,
         "s_final": s_final,
-        "groups": groups,
-        "group_meta": group_meta,
+        "log_lr_cell": log_lr_cell,
+        "log_lr_niche": log_lr_niche,
+        "bulk_pos_loglr": bulk_pos_loglr,
         "per_cell": per_cell,
     }
+
+
+def _group_one_slide(
+    payload: dict,
+    *,
+    foi_q: float,
+    tau: float,
+    data_mode: str,
+    random_seed: int,
+    logger,
+):
+    """Group one scored slide at a given negative-side FOI level ``foi_q``.
+
+    Pure + cheap (no teacher inference): the direct LR 3-class threshold plus
+    the modality-agnostic GMM/BIC bimodality refinement.  Returns
+    ``(groups, group_meta)``.
+    """
+    log = logger or logging.getLogger("MAPPER")
+    ran_spatial = payload["ran_spatial"]
+    log_lr_cell = payload["log_lr_cell"]
+    log_lr_niche = payload["log_lr_niche"]
+    groups, group_meta = likelihood_ratio_3class(
+        log_lr_cell, log_lr_niche if ran_spatial else None,
+        log_lr_threshold=tau,
+        bulk_pos_loglr=payload["bulk_pos_loglr"], foi_q=foi_q,
+        logger=log,
+    )
+    # Modality-agnostic refinement: a GMM/BIC bimodality test demotes a marginal
+    # sub-mode to background.  It runs on the call-determining evidence axis --
+    # max(cell, niche) for positives (OR rule), min(cell, niche) for negatives
+    # (AND rule) -- so niche-driven calls survive.  In scRNA (no niche) both
+    # axes reduce to log_LR_cell.  In spatial, a marginal call the *other* tier
+    # independently corroborates is a real boundary cell, not spillover, so it
+    # is protected: pos_protect = niche_pos, neg_protect = niche_neg (the latter
+    # holds for every spatial negative by the AND rule -> spatial negatives are
+    # never demoted).  ``data_mode`` no longer gates this step; the only
+    # modality difference is whether a niche tier exists at all.
+    if ran_spatial and log_lr_niche is not None:
+        pos_axis = np.maximum(log_lr_cell, log_lr_niche)
+        neg_axis = np.minimum(log_lr_cell, log_lr_niche)
+        tau_neg = float(group_meta.get("tau_neg", tau))
+        pos_protect = log_lr_niche > tau           # niche corroborates positive
+        neg_protect = log_lr_niche < -tau_neg      # niche corroborates negative
+    else:
+        pos_axis = neg_axis = log_lr_cell
+        pos_protect = neg_protect = None
+    groups, refine_meta = refine_groups_bimodal(
+        groups, pos_axis, neg_axis,
+        pos_protect=pos_protect, neg_protect=neg_protect,
+        random_seed=random_seed, logger=log,
+    )
+    group_meta["bimodal_refine"] = refine_meta
+    group_meta["n_positive"] = int((groups == "positive").sum())
+    group_meta["n_negative"] = int((groups == "negative").sum())
+    group_meta["n_background"] = int((groups == "background").sum())
+    return groups, group_meta
+
+
+def _choose_foi_q_and_group(
+    payloads,
+    *,
+    cfg: _cfg.MapperConfig,
+    data_mode: str,
+    random_seed: int,
+    logger,
+):
+    """Group every scored slide, adaptively escalating the negative-side FOI.
+
+    Start at the strict ``neg_foi_q`` and climb the ascending ladder
+    ``(neg_foi_q, *neg_foi_q_steps)`` one rung at a time.  At each rung measure
+    the negative fraction pooled over all payloads (Σ neg / Σ spots; scRNA counts
+    are post-GMM) and stop at the first rung whose fraction ≥ ``neg_frac_floor``
+    (or the last rung if none do).  Only the final (chosen-level) grouping is
+    logged.  Returns ``(groups_list, meta_list)`` aligned to ``payloads``.
+    """
+    log = logger or logging.getLogger("MAPPER")
+    tau = float(cfg.niche.log_lr_threshold)
+    ladder = (float(cfg.niche.neg_foi_q), *(float(q) for q in cfg.niche.neg_foi_q_steps))
+    floor = float(cfg.niche.neg_frac_floor)
+
+    def _pooled_neg_frac(q):
+        n_neg = n_tot = 0
+        for p in payloads:
+            g, _ = _group_one_slide(
+                p, foi_q=q, tau=tau, data_mode=data_mode,
+                random_seed=random_seed, logger=None,
+            )
+            n_neg += int((g == "negative").sum())
+            n_tot += int(g.size)
+        return (n_neg / n_tot) if n_tot > 0 else 0.0
+
+    # escalation can only move τ_neg when a bulk-positive reference exists
+    feasible = len(ladder) > 1 and any(p["bulk_pos_loglr"] is not None for p in payloads)
+
+    q_star = ladder[0]
+    if feasible:
+        # climb the ladder; stop at the first rung meeting the floor (monotone:
+        # higher q ⇒ deeper-then-floored τ_neg ⇒ never fewer negatives)
+        for q in ladder:
+            q_star = q
+            if _pooled_neg_frac(q) >= floor:
+                break
+
+    # final (chosen-level) grouping — the only pass that is logged
+    results = [
+        _group_one_slide(
+            p, foi_q=q_star, tau=tau, data_mode=data_mode,
+            random_seed=random_seed, logger=log,
+        )
+        for p in payloads
+    ]
+    groups_list = [g for g, _ in results]
+    meta_list = [m for _, m in results]
+    return groups_list, meta_list
 
 
 # ---------------------------------------------------------------------------
@@ -892,19 +1019,3 @@ def _teacher_infer_chunked(model, X, *, devices, batch_size, logger=None):
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
     return s_raw, emb
-
-
-def _expression_pca(X, *, n_components=50, logger=None):
-    log = logger or logging.getLogger("MAPPER")
-    try:
-        from sklearn.decomposition import TruncatedSVD
-        n_comp = int(min(n_components, X.shape[1] - 1, X.shape[0] - 1))
-        log.info("[expr_pca] TruncatedSVD: %s -> %d components", X.shape, n_comp)
-        svd = TruncatedSVD(n_components=n_comp, random_state=0)
-        out = svd.fit_transform(X).astype(np.float32)
-        log.info("[expr_pca] explained variance ratio sum=%.3f",
-                 float(svd.explained_variance_ratio_.sum()))
-        return out
-    except Exception as e:
-        log.warning("[expr_pca] failed (%s); using raw matrix.", e)
-        return np.asarray(X, dtype=np.float32)
