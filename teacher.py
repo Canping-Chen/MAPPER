@@ -1,537 +1,250 @@
-"""
-MAPPER bulk teacher MLP.
-
-Implements three phenotype heads:
-  - "classification": BCE (binary)
-  - "survival"      : Cox partial likelihood (Efron tie handling)
-  - "continuous"    : MSE + 0.1 * (1 - Pearson)
-
-Once trained, the teacher is FROZEN. The transfer step does NOT use the
-teacher's prediction directly on single cells (that suffers from bulk vs
-single-cell domain shift).  Instead we extract a **gene-level signature**
-via input * gradient and the transfer module computes a rank-based score on
-target cells (Plan B in the design doc).
-"""
 from __future__ import annotations
-import logging
-import math
-from dataclasses import dataclass
-from typing import Optional, Tuple
+
+from dataclasses import dataclass, field
 
 import numpy as np
-import pandas as pd
-import torch
-import torch.nn as nn
 
-from ._internal_config import TeacherConfig
+from .objectives import _auroc, _harrell_cindex
 
+ENDPOINTS = ("survival", "classification", "continuous")
 
-# ---------------------------------------------------------------------------
-# MLP module
-# ---------------------------------------------------------------------------
-class TeacherMLP(nn.Module):
-    """256 -> 64 -> out  (LayerNorm + GELU + Dropout)."""
+SCORE_CHUNK = 65_536
 
-    def __init__(
-        self,
-        n_genes: int,
-        out_dim: int,
-        hidden_dim: int = 256,
-        embed_dim: int = 64,
-        dropout: float = 0.2,
-    ):
-        super().__init__()
-        self.n_genes = int(n_genes)
-        self.out_dim = int(out_dim)
-        self.encoder = nn.Sequential(
-            nn.Linear(n_genes, hidden_dim),
-            nn.LayerNorm(hidden_dim),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim, embed_dim),
-            nn.LayerNorm(embed_dim),
-            nn.GELU(),
-            nn.Dropout(dropout),
-        )
-        self.head = nn.Linear(embed_dim, out_dim)
+EVENTS_PER_PARAMETER = 10.0
+MIN_LAMBDA = 4.0
 
-    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        z = self.encoder(x)
-        out = self.head(z)
-        return out, z
+MLP_HIDDEN = 64
+MLP_DROPOUT = 0.3
+MLP_WEIGHT_DECAY = 1e-2
+MLP_LR = 5e-3
+MLP_MAX_EPOCHS = 400
+MLP_PATIENCE = 30
+MLP_VAL_FRACTION = 0.2
+MLP_REPLICATES = 20
 
-    def embed(self, x: torch.Tensor) -> torch.Tensor:
-        return self.encoder(x)
+@dataclass(frozen=True)
+class CohortSpan:
 
+    centre: np.ndarray
+    basis: np.ndarray
+    singular_values: np.ndarray
 
-# ---------------------------------------------------------------------------
-# losses
-# ---------------------------------------------------------------------------
-def _cox_partial_likelihood_efron(
-    risk: torch.Tensor, time: torch.Tensor, event: torch.Tensor, eps: float = 1e-7,
-) -> torch.Tensor:
-    """Cox partial likelihood with Efron tie handling.
+    def __call__(self, x: np.ndarray) -> np.ndarray:
+        return (np.atleast_2d(np.asarray(x, float)) - self.centre) @ self.basis
 
-    Parameters
-    ----------
-    risk  : (N,) predicted risk score (log hazard).
-    time  : (N,) survival time.
-    event : (N,) {0, 1} event indicator (1 = event observed).
-    """
-    risk = risk.view(-1)
-    time = time.view(-1)
-    event = event.view(-1)
+def cohort_span(w: np.ndarray) -> CohortSpan | None:
+    w = np.asarray(w, dtype=float)
+    if w.shape[1] <= w.shape[0]:
+        return None
+    centre = w.mean(axis=0)
+    _, d, vt = np.linalg.svd(w - centre, full_matrices=False)
+    r = int((d > d.max() * 1e-10).sum()) if d.size else 0
+    if r == 0:
+        raise ValueError("the cohort's profiles span no directions at all")
+    return CohortSpan(centre=centre, basis=vt[:r].T, singular_values=d[:r])
 
-    # Sort by time descending so cumulative sum gives risk-set sums
-    order = torch.argsort(time, descending=True)
-    risk_s = risk[order]
-    time_s = time[order]
-    event_s = event[order]
+@dataclass(frozen=True)
+class Teacher:
+    kind: str
+    endpoint: str
+    predict: object = field(repr=False)
+    mean: float = 0.0
+    sd: float = 1.0
+    detail: dict = field(default_factory=dict)
+    span: CohortSpan | None = None
 
-    log_risk = risk_s
-    risk_exp = torch.exp(log_risk - log_risk.max())  # subtract max for stability
-    cum_risk = torch.cumsum(risk_exp, dim=0)
+    def score(self, x: np.ndarray, chunk: int = SCORE_CHUNK) -> np.ndarray:
+        x = np.atleast_2d(x)
+        n = x.shape[0]
+        out = np.empty(n, dtype=float)
+        for start in range(0, n, int(chunk)):
+            stop = min(start + int(chunk), n)
+            block = np.asarray(x[start:stop], dtype=float)
+            if self.span is not None:
+                block = self.span(block)
+            out[start:stop] = np.asarray(self.predict(block), float).ravel()
+        return (out - self.mean) / self.sd
 
-    # For Efron, we need to handle ties at each event time
-    unique_times, inverse = torch.unique_consecutive(time_s, return_inverse=True)
-    nll = risk.sum() * 0.0
-    for ti in range(unique_times.shape[0]):
-        mask = (inverse == ti) & (event_s.bool())
-        d = int(mask.sum().item())
-        if d == 0:
+def _fit_linear(w, clinical, endpoint, log=None):
+    from .head import (_fit, _n_events, design_basis, effective_df)
+
+    b = design_basis(w, clinical, endpoint)
+    gamma = _fit(b.design, clinical, endpoint, b.lam)
+    beta = b.to_features(gamma)
+    if log is not None:
+        log.record("teacher", "linear", section="teacher")
+        log.record("ridge_lambda", round(float(b.lam), 3), section="teacher")
+        log.record("effective_df", round(effective_df(b.design, b.lam), 2),
+                   section="teacher")
+        log.record("events_per_effective_parameter",
+                   round(_n_events(clinical, endpoint)
+                         / max(effective_df(b.design, b.lam), 1e-9), 2),
+                   section="teacher")
+    return lambda x: np.asarray(x, float) @ beta, {"beta": beta}
+
+def _fit_mlp(w, clinical, endpoint, seed, log=None):
+    import torch
+    import torch.nn as nn
+
+    from .objectives import cox_efron_nll
+
+    w = np.asarray(w, dtype=np.float64)
+    n, p = w.shape
+    rng = np.random.default_rng(seed)
+    torch.manual_seed(int(seed))
+    X = torch.as_tensor(w, dtype=torch.float64)
+
+    def loss_for(idx):
+        if endpoint == "survival":
+            t = torch.as_tensor(np.asarray(clinical["time"], float)[idx])
+            e = torch.as_tensor(np.asarray(clinical["event"], float)[idx])
+            return lambda s: cox_efron_nll(s, t, e)
+        if endpoint == "classification":
+            y = torch.as_tensor(np.asarray(clinical["label"]).astype(np.float64)[idx])
+            pos = float(y.sum()) or 1.0
+            wt = torch.where(y > 0, len(y) / (2 * pos),
+                             len(y) / (2 * max(len(y) - pos, 1.0)))
+            return lambda s: nn.functional.binary_cross_entropy_with_logits(
+                s, y, weight=wt)
+        v = torch.as_tensor(np.asarray(clinical["value"], float)[idx])
+        v = v - v.mean()
+        return lambda s: ((s - v) ** 2).mean()
+
+    nets, used = [], 0
+    for rep in range(MLP_REPLICATES):
+
+        boot = rng.integers(0, n, n)
+        tr = boot
+        va = np.setdiff1d(np.arange(n), np.unique(boot))
+        if va.size < 5:
             continue
-        # last index of this tie block in sorted-by-time-desc array
-        last_idx = int(torch.where(inverse == ti)[0].max().item())
-        risk_set_sum = cum_risk[last_idx]
-        # tied events sum
-        tied_idx = torch.where(mask)[0]
-        tied_sum = risk_exp[tied_idx].sum()
-        # Efron: for k = 0..d-1, denom = risk_set_sum - k/d * tied_sum
-        for k in range(d):
-            denom = risk_set_sum - (k / d) * tied_sum
-            nll = nll + torch.log(denom + eps) - log_risk[tied_idx[k]]
-    return nll / max(int(event.sum().item()), 1)
+        if endpoint == "survival" and (float(np.asarray(clinical["event"])[tr].sum()) < 3
+                                       or float(np.asarray(clinical["event"])[va].sum()) < 2):
+            continue
+        net = nn.Sequential(nn.Linear(p, MLP_HIDDEN), nn.LayerNorm(MLP_HIDDEN),
+                            nn.GELU(), nn.Dropout(MLP_DROPOUT),
+                            nn.Linear(MLP_HIDDEN, 1)).to(torch.float64)
+        opt = torch.optim.AdamW(net.parameters(), lr=MLP_LR,
+                                weight_decay=MLP_WEIGHT_DECAY)
+        tr_loss, va_loss = loss_for(tr), loss_for(va)
+        best, best_state, wait = np.inf, None, 0
+        for _ in range(MLP_MAX_EPOCHS):
+            net.train(); opt.zero_grad()
+            tr_loss(net(X[tr]).reshape(-1)).backward(); opt.step()
+            net.eval()
+            with torch.no_grad():
+                v = float(va_loss(net(X[va]).reshape(-1)))
+            if v < best - 1e-6:
+                best, wait = v, 0
+                best_state = {k: t.clone() for k, t in net.state_dict().items()}
+            else:
+                wait += 1
+                if wait >= MLP_PATIENCE:
+                    break
+        if best_state is not None:
+            net.load_state_dict(best_state)
+        net.eval()
+        nets.append(net); used += 1
 
+    if not nets:
+        raise ValueError("no MLP replicate could be trained; the cohort is too small")
 
-def _pearson_loss(pred: torch.Tensor, y: torch.Tensor, eps: float = 1e-7) -> torch.Tensor:
-    p = pred - pred.mean()
-    t = y - y.mean()
-    r = (p * t).sum() / ((p.norm() + eps) * (t.norm() + eps))
-    return 1.0 - r
-
-
-# ---------------------------------------------------------------------------
-# teacher trainer
-# ---------------------------------------------------------------------------
-@dataclass
-class TeacherFitResult:
-    model: TeacherMLP
-    metric_name: str
-    val_metric: float
-    out_dim: int
-    cls_pos_index: Optional[int] = None
-    val_history: list = None
-    refit_full: bool = False        # whether stage-2 full-data refit was run
-    best_epoch: int = -1            # stage-1 epoch (0-based) with best val metric
-    final_epochs: int = -1          # epochs the returned model was trained for
-
-
-def _resolve_phenotype_target(
-    bulk_meta: pd.DataFrame,
-    phenotype_type: str,
-    *,
-    survival_time_col: Optional[str],
-    survival_event_col: Optional[str],
-    class_col: Optional[str],
-    positive_class: Optional[str],
-    continuous_col: Optional[str],
-) -> Tuple[np.ndarray, str, int, Optional[int]]:
-    """Build the supervised target.
-
-    Returns ``(y, mode, out_dim, pos_index)``.
-
-    For classification we use BCE (binary only).
-    """
-    if phenotype_type == "classification":
-        if class_col is None:
-            raise ValueError("phenotype_type='classification' requires class_col")
-        labels = bulk_meta[class_col].astype(str).to_numpy()
-        uniq = sorted(np.unique(labels).tolist())
-        if positive_class is not None:
-            if str(positive_class) not in uniq:
-                raise ValueError(
-                    f"positive_class={positive_class!r} not found in {class_col} (unique: {uniq})"
-                )
-            if len(uniq) != 2:
-                raise ValueError(
-                    f"phenotype_type='classification' supports binary only "
-                    f"({len(uniq)} unique values found in {class_col})"
-                )
-            y = (labels == str(positive_class)).astype(np.float32)
-            return y, "binary", 1, 1
-        # no positive_class given -> assume binary with the rarer class as 1
-        if len(uniq) != 2:
-            raise ValueError(
-                f"class_col has {len(uniq)} unique values; please supply positive_class."
-            )
-        # rarer class as positive
-        counts = {c: int((labels == c).sum()) for c in uniq}
-        positive = min(counts, key=counts.get)
-        y = (labels == positive).astype(np.float32)
-        return y, "binary", 1, 1
-
-    if phenotype_type == "survival":
-        if survival_time_col is None or survival_event_col is None:
-            raise ValueError(
-                "phenotype_type='survival' requires survival_time_col + survival_event_col"
-            )
-        t = bulk_meta[survival_time_col].astype(float).to_numpy()
-        e = bulk_meta[survival_event_col].astype(float).to_numpy()
-        y = np.stack([t, e], axis=1).astype(np.float32)
-        return y, "survival", 1, None
-
-    if phenotype_type == "continuous":
-        if continuous_col is None:
-            raise ValueError("phenotype_type='continuous' requires continuous_col")
-        y = bulk_meta[continuous_col].astype(float).to_numpy().astype(np.float32)
-        return y, "continuous", 1, None
-
-    raise ValueError(f"Unknown phenotype_type: {phenotype_type}")
-
-
-def _stratified_val_split(
-    y: np.ndarray,
-    mode: str,
-    val_frac: float,
-    random_seed: int,
-) -> Tuple[np.ndarray, np.ndarray]:
-    """Stratified train / val index split.
-
-    Strata:
-      * ``binary``     -> class label (0/1)
-      * ``survival``   -> event indicator (``y[:, 1]``)
-      * ``continuous`` -> quartile bins of the target value
-
-    Within each stratum a fraction ``val_frac`` (rounded) goes to validation,
-    so the validation set keeps the same class / event / value-range balance as
-    the full cohort — important for rare-event survival and imbalanced binary
-    cohorts where a plain random split can leave val with too few (or zero)
-    positives.  Falls back to a single random holdout if the stratified split
-    would leave train or val empty.
-    """
-    n_b = int(y.shape[0])
-    rng = np.random.default_rng(random_seed)
-
-    if mode == "binary":
-        strata = np.asarray(y, dtype=np.int64).reshape(-1)
-    elif mode == "survival":
-        strata = np.asarray(y[:, 1], dtype=np.int64).reshape(-1)
-    elif mode == "continuous":
-        vals = np.asarray(y, dtype=float).reshape(-1)
-        n_bins = 4 if n_b >= 10 else 1
-        if n_bins <= 1 or np.unique(vals).size < n_bins:
-            strata = np.zeros(n_b, dtype=np.int64)          # degenerate -> random
-        else:
-            edges = np.quantile(vals, [0.25, 0.5, 0.75])
-            strata = np.digitize(vals, edges).astype(np.int64)
-    else:
-        strata = np.zeros(n_b, dtype=np.int64)
-
-    val_mask = np.zeros(n_b, dtype=bool)
-    for s in np.unique(strata):
-        idx = np.where(strata == s)[0]
-        rng.shuffle(idx)
-        n_val_s = int(round(val_frac * idx.size))
-        val_mask[idx[:n_val_s]] = True
-
-    val_idx = np.where(val_mask)[0]
-    tr_idx = np.where(~val_mask)[0]
-
-    # fallback: never return an empty train or val set
-    if val_idx.size == 0 or tr_idx.size == 0:
-        perm = rng.permutation(n_b)
-        n_val = max(1, min(n_b - 1, int(n_b * val_frac)))
-        val_idx = perm[:n_val]
-        tr_idx = perm[n_val:]
-
-    return tr_idx, val_idx
-
-
-def _bce_pos_weight(y_arr: np.ndarray, mode: str, device) -> Optional[torch.Tensor]:
-    """BCE ``pos_weight = N_neg / N_pos`` for binary classification.
-
-    Gives the rarer class proportionally more weight so the loss is not
-    dominated by the majority class.  Symmetric: when positives are the
-    majority the weight is < 1 (down-weights positives, i.e. relatively
-    up-weights the rarer negatives).  Returns ``None`` for non-binary modes or
-    when either class is absent (nothing to balance).
-    """
-    if mode != "binary":
-        return None
-    arr = np.asarray(y_arr).reshape(-1)
-    n_pos = float((arr == 1).sum())
-    n_neg = float((arr == 0).sum())
-    if n_pos <= 0 or n_neg <= 0:
-        return None
-    return torch.tensor(n_neg / n_pos, dtype=torch.float32, device=device)
-
-
-def _minority_frac(y: np.ndarray, mode: str):
-    """Minority class / event fraction in [0, 0.5]; ``None`` for continuous.
-
-    binary   : min(p, 1-p) over the 0/1 labels
-    survival : min(event_rate, 1-event_rate) over y[:,1]
-    continuous: None (no class proportion — only the size criterion applies)
-    """
-    if mode == "binary":
-        r = float(np.mean(np.asarray(y).reshape(-1)))
-        return min(r, 1.0 - r)
-    if mode == "survival":
-        r = float(np.mean(np.asarray(y)[:, 1]))
-        return min(r, 1.0 - r)
-    return None
-
-
-def _decide_refit(y: np.ndarray, mode: str, n_b: int, cfg) -> bool:
-    """Decide whether to run the stage-2 full-data refit.
-
-    ``cfg.refit_full`` overrides when set (True/False); otherwise AUTO: refit
-    when the cohort is small (``n_b < refit_min_bulk``) OR imbalanced (minority
-    fraction ``< refit_min_class_frac``).  Boundaries (==threshold) skip refit.
-    """
-    if cfg.refit_full is not None:
-        return bool(cfg.refit_full)
-    small = n_b < cfg.refit_min_bulk
-    mf = _minority_frac(y, mode)
-    imbalanced = (mf is not None) and (mf < cfg.refit_min_class_frac)
-    return small or imbalanced
-
-
-def fit_teacher(
-    bulk_X: np.ndarray,                # (n_b, g) aligned to shared genes
-    bulk_meta: pd.DataFrame,
-    phenotype_type: str,
-    *,
-    survival_time_col: Optional[str] = None,
-    survival_event_col: Optional[str] = None,
-    class_col: Optional[str] = None,
-    positive_class: Optional[str] = None,
-    continuous_col: Optional[str] = None,
-    config: Optional[TeacherConfig] = None,
-    device: Optional[torch.device] = None,
-    random_seed: int = 42,
-    logger: Optional[logging.Logger] = None,
-) -> TeacherFitResult:
-    cfg = config or TeacherConfig()
-    if device is None:
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    log = logger or logging.getLogger("MAPPER")
-
-    n_b, n_g = bulk_X.shape
-    y, mode, out_dim, pos_idx = _resolve_phenotype_target(
-        bulk_meta,
-        phenotype_type,
-        survival_time_col=survival_time_col,
-        survival_event_col=survival_event_col,
-        class_col=class_col,
-        positive_class=positive_class,
-        continuous_col=continuous_col,
-    )
-
-    # stratified train / val split (by class / event / value-quartile)
-    tr_idx, val_idx = _stratified_val_split(y, mode, cfg.val_frac, random_seed)
-    n_val = int(val_idx.size)
-
-    Xtr = torch.as_tensor(bulk_X[tr_idx], dtype=torch.float32, device=device)
-    Xva = torch.as_tensor(bulk_X[val_idx], dtype=torch.float32, device=device)
-    # Targets are encoded identically across modes; the validation metric reads
-    # y[val_idx] directly (numpy), so only the training-side tensor is needed.
-    ytr = torch.as_tensor(y[tr_idx], dtype=torch.float32, device=device)
-
-    model = TeacherMLP(
-        n_genes=n_g,
-        out_dim=out_dim,
-        hidden_dim=cfg.hidden_dim,
-        embed_dim=cfg.embed_dim,
-        dropout=cfg.dropout,
-    ).to(device)
-    opt = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
-    sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=cfg.max_epochs)
-
-    bs = min(cfg.batch_size_max, max(8, int(math.ceil(len(tr_idx) / 4))))
-    pos_weight_tr = _bce_pos_weight(y[tr_idx], mode, device)
-
-    def _loss(out, target, mode, pos_weight=None):
-        if mode == "binary":
-            return torch.nn.functional.binary_cross_entropy_with_logits(
-                out.view(-1), target.view(-1), pos_weight=pos_weight
-            )
-        if mode == "survival":
-            time = target[:, 0]; event = target[:, 1]
-            return _cox_partial_likelihood_efron(out.view(-1), time, event)
-        # continuous
-        out_v = out.view(-1)
-        target_v = target.view(-1)
-        mse = torch.nn.functional.mse_loss(out_v, target_v)
-        peason = _pearson_loss(out_v, target_v)
-        return mse + 0.1 * peason
-
-    def _val_metric(model, mode):
-        model.eval()
+    def predict(x):
+        t = torch.as_tensor(np.asarray(x, dtype=np.float64))
         with torch.no_grad():
-            out, _ = model(Xva)
-            if mode == "binary":
-                p = torch.sigmoid(out.view(-1))
-                return _auroc(p.cpu().numpy(), y[val_idx])
-            if mode == "survival":
-                risk = out.view(-1).cpu().numpy()
-                t = y[val_idx, 0]; e = y[val_idx, 1]
-                return _cindex(t, risk, e)
-            # continuous
-            pred = out.view(-1).cpu().numpy()
-            return _pearson(pred, y[val_idx])
+            return np.mean([net(t).reshape(-1).numpy() for net in nets], axis=0)
 
-    best = (-math.inf if mode != "survival" else -math.inf)
-    best_sd = {k: v.detach().clone() for k, v in model.state_dict().items()}
-    best_epoch = 0
-    bad_epochs = 0
-    history = []
-    metric_name = {
-        "binary": "AUROC", "survival": "C-index", "continuous": "Pearson",
-    }[mode]
+    if log is not None:
+        log.record("teacher", "mlp", section="teacher")
+        log.record("hidden", MLP_HIDDEN, section="teacher")
+        log.record("dropout", MLP_DROPOUT, section="teacher")
+        log.record("weight_decay", MLP_WEIGHT_DECAY, section="teacher")
+        log.record("replicates", used, section="teacher")
+        log.record("validation", "out-of-bag", section="teacher")
+        log.record("n_parameters", int(sum(q.numel() for q in nets[0].parameters())),
+                   section="teacher")
+    return predict, {"n_replicates": used, "validation": "out-of-bag"}
 
-    for ep in range(cfg.max_epochs):
-        model.train()
-        perm_in = torch.randperm(len(tr_idx), device=device)
-        ep_loss = 0.0
-        n_batches = 0
-        for s in range(0, len(tr_idx), bs):
-            ix = perm_in[s : s + bs]
-            xb = Xtr[ix]
-            yb = ytr[ix]
-            opt.zero_grad()
-            out, _ = model(xb)
-            loss = _loss(out, yb, mode, pos_weight_tr)
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
-            opt.step()
-            ep_loss += float(loss.detach().cpu())
-            n_batches += 1
-        sched.step()
-        m = _val_metric(model, mode)
-        history.append({"epoch": ep, "train_loss": ep_loss / max(n_batches, 1), "val": m})
-        if m > best + 1e-6:
-            best = m
-            best_epoch = ep
-            best_sd = {k: v.detach().clone() for k, v in model.state_dict().items()}
-            bad_epochs = 0
-        else:
-            bad_epochs += 1
-            if bad_epochs >= cfg.patience:
-                break
-
-    # ---- Stage 2: optional refit on ALL bulk samples ----
-    # Reuse the early-stopping point (best_epoch) found on the holdout, but
-    # train a fresh model from scratch on every labelled sample for that many
-    # epochs (no val, no early stopping). The LR schedule keeps the same
-    # T_max so each epoch's learning rate matches stage 1.
-    final_epochs = best_epoch + 1
-    refit_done = False
-    do_refit = _decide_refit(y, mode, n_b, cfg)
-    if do_refit and n_b > n_val:
-        torch.manual_seed(random_seed)
-        Xall = torch.as_tensor(bulk_X, dtype=torch.float32, device=device)
-        yall = torch.as_tensor(y, dtype=torch.float32, device=device)
-        model = TeacherMLP(
-            n_genes=n_g, out_dim=out_dim,
-            hidden_dim=cfg.hidden_dim, embed_dim=cfg.embed_dim, dropout=cfg.dropout,
-        ).to(device)
-        opt = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
-        sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=cfg.max_epochs)
-        bs_all = min(cfg.batch_size_max, max(8, int(math.ceil(n_b / 4))))
-        pos_weight_all = _bce_pos_weight(y, mode, device)
-        for ep in range(final_epochs):
-            model.train()
-            perm_all = torch.randperm(n_b, device=device)
-            for s in range(0, n_b, bs_all):
-                ix = perm_all[s : s + bs_all]
-                xb = Xall[ix]
-                yb = yall[ix]
-                opt.zero_grad()
-                out, _ = model(xb)
-                loss = _loss(out, yb, mode, pos_weight_all)
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
-                opt.step()
-            sched.step()
-        refit_done = True
-    else:
-        # keep the stage-1 best-on-val weights (deploy early-stopped model)
-        model.load_state_dict(best_sd)
-
-    for p in model.parameters():
-        p.requires_grad = False
-
-    log.info(
-        "[teacher] mode=%s n_b=%d n_g=%d stage1_epochs=%d best_epoch=%d best %s=%.4f",
-        mode, n_b, n_g, len(history), best_epoch, metric_name, best,
-    )
-    return TeacherFitResult(
-        model=model,
-        metric_name=metric_name,
-        val_metric=float(best),
-        out_dim=out_dim,
-        cls_pos_index=pos_idx,
-        val_history=history,
-        refit_full=refit_done,
-        best_epoch=int(best_epoch),
-        final_epochs=int(final_epochs) if refit_done else len(history),
-    )
-
-
-# ---------------------------------------------------------------------------
-# small metric utils (no sklearn dependency for survival / pearson)
-# ---------------------------------------------------------------------------
-def _auroc(p: np.ndarray, y: np.ndarray) -> float:
-    """Trapezoidal AUROC via sorted-by-score cumulative TP/FP."""
-    p = np.asarray(p, dtype=float)
-    y = np.asarray(y, dtype=int)
-    if y.sum() == 0 or y.sum() == len(y):
-        return 0.5
-    order = np.argsort(-p)
-    y_sorted = y[order]
-    tp = np.cumsum(y_sorted)
-    fp = np.cumsum(1 - y_sorted)
-    tpr = tp / max(int(y.sum()), 1)
-    fpr = fp / max(int((1 - y).sum()), 1)
-    auc = float(np.trapezoid(tpr, fpr))
-    return auc
-
-
-def _cindex(time: np.ndarray, risk: np.ndarray, event: np.ndarray) -> float:
-    """Harrell C-index. O(N^2) — fine for n_b <= a few thousand."""
-    time = np.asarray(time)
-    risk = np.asarray(risk)
-    event = np.asarray(event)
-    n = len(time)
-    num = 0
-    den = 0
-    for i in range(n):
-        if event[i] == 0:
+def _raw_out_of_fold(w, clinical, endpoint, kind, seed, folds):
+    n = w.shape[0]
+    folds = int(max(2, min(folds, n)))
+    fold = np.random.default_rng(seed).permutation(n) % folds
+    out = np.full(n, np.nan)
+    for f in range(folds):
+        test = fold == f
+        train = ~test
+        sub = {k: np.asarray(v)[train] for k, v in clinical.items()}
+        if endpoint == "survival" and float(np.asarray(sub["event"]).sum()) < 3:
             continue
-        for j in range(n):
-            if i == j:
-                continue
-            if time[j] > time[i]:
-                den += 1
-                if risk[i] > risk[j]:
-                    num += 1
-                elif risk[i] == risk[j]:
-                    num += 0.5
-    return float(num / den) if den > 0 else 0.5
+        span = cohort_span(w[train]) if kind == "mlp" else None
+        design = span(w[train]) if span is not None else w[train]
+        fit = _fit_linear if kind == "linear" else _fit_mlp
+        predict = (fit(design, sub, endpoint)[0] if kind == "linear"
+                   else fit(design, sub, endpoint, seed)[0])
+        held = span(w[test]) if span is not None else w[test]
+        out[test] = np.asarray(predict(held), float).ravel()
+    if not np.isfinite(out).any():
+        raise ValueError("no fold could be fitted; the cohort is too small")
+    return out
 
+def fit_teacher(w, clinical, endpoint: str, kind: str = "mlp", seed: int = 42,
+                folds: int = 5, log=None) -> Teacher:
+    if endpoint not in ENDPOINTS:
+        raise ValueError(f"unknown endpoint {endpoint!r}; expected one of {ENDPOINTS}")
+    w = np.asarray(w, dtype=float)
+    span = cohort_span(w) if kind == "mlp" else None
+    design = span(w) if span is not None else w
+    if kind == "linear":
+        predict, detail = _fit_linear(design, clinical, endpoint, log=log)
+    elif kind == "mlp":
+        predict, detail = _fit_mlp(design, clinical, endpoint, seed, log=log)
+    else:
+        raise ValueError(f"unknown teacher {kind!r}; expected 'linear' or 'mlp'")
 
-def _pearson(a: np.ndarray, b: np.ndarray, eps: float = 1e-9) -> float:
-    a = np.asarray(a, dtype=float); b = np.asarray(b, dtype=float)
-    a = a - a.mean(); b = b - b.mean()
-    return float((a * b).sum() / (np.linalg.norm(a) * np.linalg.norm(b) + eps))
+    raw_oof = _raw_out_of_fold(w, clinical, endpoint, kind, seed, folds)
+    seen = np.isfinite(raw_oof)
+    mean = float(raw_oof[seen].mean())
+    sd = float(raw_oof[seen].std()) or 1.0
+
+    detail = dict(detail)
+    detail["n_inputs"] = int(design.shape[1])
+    detail["basis_singular_values"] = (np.empty(0) if span is None
+                                       else span.singular_values)
+    detail["calibration"] = "out-of-fold"
+    detail["folds"] = int(folds)
+    detail["oof"] = (raw_oof - mean) / sd
+    t = Teacher(kind=kind, endpoint=endpoint, predict=predict,
+                mean=mean, sd=sd, detail=detail, span=span)
+    if log is not None:
+        log.record("teacher_inputs", int(design.shape[1]), section="teacher")
+        log.record("cohort_span_rank", 0 if span is None else int(span.basis.shape[1]),
+                   section="teacher")
+        log.record("calibration", "out-of-fold", section="teacher")
+        log.record("calibration_folds", int(folds), section="teacher")
+        log.record("cohort_concordance_insample",
+                   round(concordance(t, w, clinical, endpoint), 4), section="teacher")
+        log.record("cohort_concordance_crossfit",
+                   round(_concordance_of(detail["oof"], clinical, endpoint), 4),
+                   section="teacher")
+    return t
+
+def _concordance_of(s, clinical, endpoint: str) -> float:
+    s = np.asarray(s, float)
+    ok = np.isfinite(s)
+    if endpoint == "survival":
+        return float(_harrell_cindex(np.asarray(clinical["time"], float)[ok], s[ok],
+                                     np.asarray(clinical["event"], float)[ok]))
+    if endpoint == "classification":
+        return float(_auroc(s[ok], np.asarray(clinical["label"]).astype(float)[ok]))
+    v = np.asarray(clinical["value"], float)[ok]
+    return float(0.5 + 0.5 * np.corrcoef(s[ok], v)[0, 1]) if v.std() > 0 else 0.5
+
+def concordance(teacher: Teacher, w, clinical, endpoint: str) -> float:
+    s = teacher.score(w)
+    if endpoint == "survival":
+        return float(_harrell_cindex(np.asarray(clinical["time"], float), s,
+                                     np.asarray(clinical["event"], float)))
+    if endpoint == "classification":
+        return float(_auroc(s, np.asarray(clinical["label"]).astype(float)))
+    v = np.asarray(clinical["value"], float)
+    return float(0.5 + 0.5 * np.corrcoef(s, v)[0, 1]) if v.std() > 0 else 0.5
