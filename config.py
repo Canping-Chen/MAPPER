@@ -18,7 +18,23 @@ RESOLUTION: Mapping[str, str] = {
     "xenium": "cell",
     "atera": "cell",
     "openst": "cell",
-    "scrna": "cell",
+    "scrna": "spot",   # per-gene coordinate (user override, 2026-10-08): scRNA
+                        # uses the per-gene z path, not the Hallmark50 axes.
+}
+
+# Per-platform detected-gene floor: a unit detecting fewer than this many genes
+# is marked unusable. Visium spots pool many cells and scRNA cells are deep, so
+# both carry thousands of genes (500 removes only degenerate units); imaging /
+# bead platforms (Xenium targeted panel, Atera, Open-ST, Visium-HD) detect far
+# fewer genes per unit, so no floor is applied there (0 = keep every unit; user
+# override, 2026-10-09).
+MIN_GENES: Mapping[str, int] = {
+    "visium": 500,
+    "visium_hd": 0,
+    "xenium": 0,
+    "atera": 0,
+    "openst": 0,
+    "scrna": 500,
 }
 
 FREEZE_BASIS: Mapping[str, bool] = {"spot": True, "cell": True}
@@ -80,6 +96,16 @@ class MapperConfig:
 
     def reliability_floor(self, resolution: str) -> float | None:
         return self.min_axis_reliability if resolution == "cell" else None
+
+    def min_genes(self, platform: str) -> int:
+        key = platform.lower()
+        if key not in MIN_GENES:
+            raise ValueError(
+                f"unknown platform {platform!r}; known platforms are "
+                f"{sorted(MIN_GENES)}"
+            )
+        override = self.extra.get("min_genes")
+        return int(override) if override is not None else MIN_GENES[key]
 
     def radius_um(self, platform: str) -> float | None:
         key = platform.lower()

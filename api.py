@@ -65,16 +65,42 @@ def prepare(adata, cohort, platform: str, cfg: MapperConfig | None = None,
 
     slide = read_slide_matrix(adata, counts_layer=counts_layer, log=log,
                               allow_normalized_surrogate=allow_normalized_surrogate)
-    panel = build_panel(slide.genes, cohort.genes, detection_fraction(slide.counts),
+
+    resolution = cfg.resolution(platform)
+    log.record("resolution", resolution)
+    # Per-platform detected-gene floor (cfg.min_genes), counted over the full gene
+    # set. Applied as a PRE-PANEL spot filter: units below the floor are removed
+    # BEFORE the panel and per-gene reference are built, so a low-complexity unit
+    # cannot drag a gene's detection fraction out of the panel. Visium/scRNA carry
+    # thousands of genes (500); imaging/bead platforms far fewer (near-empty guard, 5).
+    min_genes = cfg.min_genes(platform)
+    log.record("min_genes", min_genes, section="panel")
+    gene_floor = np.ones(slide.counts.shape[0], dtype=bool)
+    if min_genes > 0:
+        detected = np.asarray((slide.counts > 0).sum(axis=1)).ravel()
+        gene_floor = detected >= min_genes
+        log.record("n_units_below_min_genes", int((~gene_floor).sum()), section="panel")
+        if not gene_floor.any():
+            raise ValueError(f"min_genes={min_genes} removed every unit")
+
+    panel_counts = slide.counts[gene_floor]
+    panel = build_panel(slide.genes, cohort.genes, detection_fraction(panel_counts),
                         cohort.expr.mean(axis=0) * COMPOSITION_TO_TPM, cfg, log=log)
-    counts = sparse.csr_matrix(slide.counts)[:, panel.slide_index]
+    counts = sparse.csr_matrix(panel_counts)[:, panel.slide_index]
     library = np.asarray(counts.sum(axis=1)).ravel().astype(float)
-    usable = library >= MIN_COUNTS_PER_UNIT
+    depth_ok = library >= MIN_COUNTS_PER_UNIT
     log.record("min_counts_per_unit", MIN_COUNTS_PER_UNIT, section="panel")
-    log.record("n_units_below_depth_floor", int((~usable).sum()), section="panel")
+    log.record("n_units_below_depth_floor", int((~depth_ok).sum()), section="panel")
+
+    # `usable` is a mask over the ORIGINAL units, so apply_head can scatter scores
+    # back into adata.obs; `counts`/`library` hold only the surviving units.
+    usable = np.zeros(slide.counts.shape[0], dtype=bool)
+    usable[np.flatnonzero(gene_floor)[depth_ok]] = True
     if not usable.any():
-        raise ValueError(f"no unit reaches {MIN_COUNTS_PER_UNIT} panel counts")
-    counts, library = counts[usable], library[usable]
+        raise ValueError(
+            f"no unit reaches {MIN_COUNTS_PER_UNIT} panel counts"
+            + (f" and {min_genes} detected genes" if min_genes else ""))
+    counts, library = counts[depth_ok], library[depth_ok]
 
     q = cfg.extra.get("match_unit_depth")
     if q is None:
@@ -89,9 +115,6 @@ def prepare(adata, cohort, platform: str, cfg: MapperConfig | None = None,
         log.record("n_units_already_shallower", int((library < target).sum()),
                    section="panel")
     bulk_p = _rownorm(cohort.expr[:, panel.bulk_index])
-
-    resolution = cfg.resolution(platform)
-    log.record("resolution", resolution)
 
     adj = _graph(adata, platform, cfg, section_key, usable, coord_key, log)
     mode = str(cfg.extra.get("denoise") or "none")
@@ -205,6 +228,19 @@ def apply_head(rep: Representation, cohort, cfg: MapperConfig | None = None):
     hi, lo, sign = reference_scores(teacher, rep.cohort, clinical,
                                     cohort.endpoint, frame=frame, log=log)
 
+    # Background half-width: hi/lo are the risk- and protective-patient median
+    # scores; their midpoint is the cohort's risk/protective boundary. c=1.0
+    # keeps the full inter-median dead-zone (conservative, few calls); c<1.0
+    # shrinks the background band toward the boundary, raising both the positive
+    # and negative fractions without moving the decision boundary.
+    c = float(cfg.extra.get("background_halfwidth", 1.0))
+    if c != 1.0:
+        m = 0.5 * (hi + lo)
+        hi, lo = m + c * (hi - m), m + c * (lo - m)
+        log.record("background_halfwidth", c, section="calls")
+        log.record("threshold_bad_group_shrunk", round(hi, 4), section="calls")
+        log.record("threshold_good_group_shrunk", round(lo, 4), section="calls")
+
     unit_score = sign * teacher.score(rep.unit)
     niche_score = np.full(unit_score.shape, np.nan)
     if rep.has_niche.any():
@@ -281,3 +317,51 @@ def _clinical(cohort) -> dict:
 
 def run(adata, cohort, platform: str, cfg=None, **kw):
     return apply_head(prepare(adata, cohort, platform, cfg, **kw), cohort, cfg)
+
+
+def mapper(adata, bulk_expr, bulk_meta, phenotype_type: str = "survival", *,
+           survival_time_col: str = "survival_time",
+           survival_event_col: str = "vital_status",
+           sample_col: str | None = None,
+           label_col: str | None = None, positive_class=None,
+           value_col: str | None = None,
+           platform: str = "visium", call_rule: str = "mean",
+           background_halfwidth: float | None = None,
+           denoise: str | None = None, min_genes: int | None = None,
+           drop_mt: bool | None = None,
+           section_key: str | None = None, counts_layer: str | None = None,
+           coord_key: str = "spatial",
+           seed: int = 42, cfg: MapperConfig | None = None):
+    """One-call MAPPER on a slide against an in-memory bulk teacher.
+
+    ``bulk_expr`` is samples x genes of log2(TPM+1); ``bulk_meta`` holds the
+    phenotype (keyed by ``sample_col`` or its index). Writes ``MAPPER.Score`` and
+    ``MAPPER.Group`` into ``adata.obs`` (and the run log into ``adata.uns``) and
+    returns ``adata``.
+    """
+    from .io_bulk import cohort_from_frames
+
+    endpoint = {"survival": "survival", "classification": "classification",
+                "continuous": "continuous"}.get(phenotype_type)
+    if endpoint is None:
+        raise ValueError(f"unknown phenotype_type {phenotype_type!r}; expected "
+                         f"'survival', 'classification' or 'continuous'")
+    cohort = cohort_from_frames(
+        bulk_expr, bulk_meta, endpoint, sample_col=sample_col,
+        time_col=survival_time_col, event_col=survival_event_col,
+        label_col=label_col, positive_class=positive_class, value_col=value_col)
+
+    if cfg is None:
+        cfg = (MapperConfig(seed=seed) if drop_mt is None
+               else MapperConfig(seed=seed, drop_mt=drop_mt))
+    cfg.extra["call_rule"] = call_rule
+    if background_halfwidth is not None:
+        cfg.extra["background_halfwidth"] = background_halfwidth
+    if denoise is not None:
+        cfg.extra["denoise"] = denoise
+    if min_genes is not None:
+        cfg.extra["min_genes"] = min_genes
+
+    run(adata, cohort, platform, cfg, section_key=section_key,
+        counts_layer=counts_layer, coord_key=coord_key)
+    return adata

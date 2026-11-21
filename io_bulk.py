@@ -167,6 +167,101 @@ def _continuous(aligned, value_col):
         raise ValueError(f"column {value_col!r} holds non-finite values")
     return keep, {"value": value}
 
+def _linear_from_log2(frame: pd.DataFrame) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """A DataFrame of log2(TPM+1), samples x genes, -> (linear, genes, samples)."""
+    samples = [str(s) for s in frame.index]
+    genes = [str(g) for g in frame.columns]
+    for names, what in ((samples, "sample ids"), (genes, "gene symbols")):
+        dup = _duplicates(names)
+        if dup:
+            raise ValueError(f"expression frame has duplicate {what} {dup[:5]}; "
+                             f"de-duplicate upstream and say how")
+    log2 = frame.to_numpy(dtype=float)
+    if not np.isfinite(log2).all():
+        raise ValueError("expression matrix contains non-finite values")
+    if log2.min() < -NEGATIVE_TOLERANCE:
+        raise ValueError(
+            f"expression minimum is {log2.min():.4g}: these are not log2(TPM+1) "
+            f"values, and inverting them would invent negative mass")
+    linear = np.maximum(np.exp2(log2) - 1.0, 0.0)
+    return linear, np.asarray(genes, dtype=object), np.asarray(samples, dtype=object)
+
+
+def cohort_from_frames(
+    bulk_expr: pd.DataFrame,
+    bulk_meta: pd.DataFrame,
+    endpoint: str,
+    *,
+    sample_col: str | None = None,
+    time_col: str | None = None,
+    event_col: str | None = None,
+    label_col: str | None = None,
+    positive_class: Any = None,
+    value_col: str | None = None,
+    log=None,
+) -> BulkCohort:
+    """Build a BulkCohort from in-memory DataFrames.
+
+    ``bulk_expr`` is samples x genes of log2(TPM+1); ``bulk_meta`` carries the
+    phenotype, keyed by ``sample_col`` (a column) or, when that is None, by its
+    index. Expression and clinical samples are intersected and sorted by name --
+    the ordering contract that teacher bootstrapping and the direction gate
+    depend on (see CLAUDE.md).
+    """
+    if endpoint not in ENDPOINTS:
+        raise ValueError(f"unknown endpoint {endpoint!r}; expected one of {ENDPOINTS}")
+    if endpoint == "classification" and (label_col is None or positive_class is None):
+        raise ValueError("endpoint='classification' requires label_col and positive_class")
+    if endpoint == "continuous" and value_col is None:
+        raise ValueError("endpoint='continuous' requires value_col")
+
+    linear, genes, samples = _linear_from_log2(bulk_expr)
+
+    meta = bulk_meta.copy()
+    if sample_col is None:
+        meta = meta.reset_index()
+        sample_col = meta.columns[0]
+    if sample_col not in meta.columns:
+        raise ValueError(f"sample_col={sample_col!r} is not a column of bulk_meta; "
+                         f"columns are {list(meta.columns)}")
+
+    common = sorted(set(map(str, samples)) & set(meta[sample_col].astype(str)))
+    if not common:
+        raise ValueError("bulk_expr and bulk_meta share no sample ids")
+    pos = {s: i for i, s in enumerate(map(str, samples))}
+    linear = linear[[pos[s] for s in common]]
+    samples = np.asarray(common, dtype=object)
+
+    sums = linear.sum(axis=1)
+    if np.any(sums <= 0):
+        raise ValueError(f"samples with no expressed mass: {samples[sums <= 0][:5].tolist()}")
+    expr = linear / sums[:, None]
+
+    if endpoint == "survival":
+        time_col = time_col or "survival_time"
+        event_col = event_col or "vital_status"
+    aligned = _align(meta, sample_col, samples)
+    if endpoint == "survival":
+        keep, fields = _survival(aligned, time_col, event_col)
+    elif endpoint == "classification":
+        keep, fields = _classification(aligned, label_col, positive_class)
+    else:
+        keep, fields = _continuous(aligned, value_col)
+    if not keep.any():
+        raise ValueError(f"every sample was dropped for a missing {endpoint} endpoint")
+
+    cohort = BulkCohort(expr=expr[keep], genes=genes, samples=samples[keep],
+                        endpoint=endpoint, **fields)
+    if log is not None:
+        log.record("endpoint", endpoint, section="bulk")
+        log.record("sample_column", sample_col, section="bulk")
+        log.record("n_samples", int(cohort.expr.shape[0]), section="bulk")
+        log.record("n_genes", int(genes.shape[0]), section="bulk")
+        log.record("n_events", cohort.n_events, section="bulk")
+        log.record("renormalised_per_sample", True, section="bulk")
+    return cohort
+
+
 def load_bulk(
     expr_csv,
     clin_csv,

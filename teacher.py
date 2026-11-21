@@ -20,7 +20,7 @@ MLP_LR = 5e-3
 MLP_MAX_EPOCHS = 400
 MLP_PATIENCE = 30
 MLP_VAL_FRACTION = 0.2
-MLP_REPLICATES = 20
+MLP_REPLICATES = 30
 
 @dataclass(frozen=True)
 class CohortSpan:
